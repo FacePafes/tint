@@ -86,7 +86,7 @@ Requires an X11 or XWayland session (`$DISPLAY`) and a 24/32-bit little endian d
 | `x11.h`, `x11.c` | the backend: window, framebuffer, events, clipboard, cursors. Usable on its own. |
 | `fonts.h`, `font8x8.c`, `font_eu.c`, `font_zh.c` | fonts, one file each link only what you use (see below) |
 | `mkfont.py` | generates a font file for any language from GNU Unifont |
-| `demo.c` | a tour of everything; headless tests with a scripted fake backend |
+| `demo.c` | a tour of everything |
 | `LICENSE.md`, `COPYING.md` | LGPL-3.0 and GPL-3.0 texts (the LGPL builds on the GPL) |
 | `OFL.md` | SIL Open Font License 1.1, for the Unifont-derived fonts |
 
@@ -115,10 +115,10 @@ Included fonts:
 **Own fonts:**
 
 ```sh
-mkfont.py tw --ranges 20-7e,a0-ff --codec big5:a140-a3bf --codec big5:a440-c67e     # Traditional Chinese
-mkfont.py jp --ranges 20-7e,3000-30ff --codec shift_jis:889f-9ffc                    # Japanese: kana + level-1 kanji
-mkfont.py kr --ranges 20-7e --codec euc-kr:b0a1-c8fe                                 # Korean: 2,350 Hangul syllables
-mkfont.py ui --text all_my_strings.txt                                               # exactly the characters you use
+python3 mkfont.py tw --ranges 20-7e,a0-ff --codec big5:a140-a3bf --codec big5:a440-c67e     # Traditional Chinese
+python3 mkfont.py jp --ranges 20-7e,3000-30ff --codec shift_jis:889f-9ffc                    # Japanese: kana + level-1 kanji
+python3 mkfont.py kr --ranges 20-7e --codec euc-kr:b0a1-c8fe                                 # Korean: 2,350 Hangul syllables
+python3 mkfont.py ui --text all_my_strings.txt                                               # exactly the characters you use
 ```
 
 then `extern const TintFont tint_font_tw;`. Needs Python with Pillow and the `fonts-unifont` package
