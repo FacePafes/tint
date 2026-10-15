@@ -268,7 +268,7 @@ int x_open(int w, int h, const char *title, uint32_t bg) {
         send_req(b, 16);
     }
     set_title(title);
-    chg_prop(X.win, 67, 31, 8, "tint\0tint", 12);           /* WM_CLASS */
+    chg_prop(X.win, 67, 31, 8, "tint\0tint", sizeof "tint\0Tint");           /* WM_CLASS */
     chg_prop(X.win, X.a_proto, 4, 32, &X.a_del, 4);            /* WM_PROTOCOLS: WM_DELETE_WINDOW */
 
     /* cursors come from the standard "cursor" font (errors, if any, are ignored) */
