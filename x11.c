@@ -160,13 +160,19 @@ static int poll_readable(int ms) {
 
 /* requests */
 static void chg_prop(uint32_t win, uint32_t prop, uint32_t type, int fmt, const void *data, size_t nbytes) {
-    size_t total = 24 + (size_t)pad4((int)nbytes);
-    uint8_t *b = calloc(1, total);
-    b[0] = 18; b[1] = 0; p16(b, 2, (unsigned)(total / 4));
-    p32(b, 4, win); p32(b, 8, prop); p32(b, 12, type); b[16] = (uint8_t)fmt;
-    p32(b, 20, (uint32_t)(nbytes / (size_t)(fmt / 8)));
-    memcpy(b + 24, data, nbytes);
-    send_req(b, total); free(b);
+    size_t maxw = X.maxreq ? X.maxreq : 4096;
+    if (maxw > 65535) maxw = 65535;
+    size_t chunk = (maxw - 6) * 4;                       /* data bytes per request */
+    const uint8_t *src = data; int mode = 0;             /* 0 = Replace, 2 = Append */
+    do {
+        size_t n = nbytes < chunk ? nbytes : chunk, padn = (4 - (n & 3)) & 3;
+        uint8_t hd[24]; memset(hd, 0, sizeof hd);
+        hd[0] = 18; hd[1] = (uint8_t)mode; p16(hd, 2, (unsigned)(6 + (n + padn) / 4));
+        p32(hd, 4, win); p32(hd, 8, prop); p32(hd, 12, type); hd[16] = (uint8_t)fmt;
+        p32(hd, 20, (uint32_t)(n / (size_t)(fmt / 8)));
+        X.seq++; wr_all(hd, 24); wr_all(src, n); wr_all("\0\0\0", padn);
+        src += n; nbytes -= n; mode = 2;
+    } while (nbytes);
 }
 static void set_title(const char *t) {
     chg_prop(X.win, 39, 31, 8, t, strlen(t));
