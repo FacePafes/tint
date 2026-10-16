@@ -74,6 +74,9 @@ void tint_scroll_end(void);                        /* (max 4 deep) */
 
 /* widgets (return 1 / non-zero on the event described) */
 void tint_label(const char *s);
+#if defined(__GNUC__)
+__attribute__((format(printf, 1, 2)))
+#endif
 void tint_labelf(const char *fmt, ...);
 int  tint_button(const char *label);               /* clicked */
 int  tint_check(const char *label, int *v);        /* toggled */
