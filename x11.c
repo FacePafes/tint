@@ -152,15 +152,19 @@ static void process_raw(const uint8_t *e);
 
 static void read_msg(uint8_t *m) {
     rd_all(m, 32);
-    if ((m[0] & 0x7f) == 35) { uint32_t n = g32(m, 4) * 4; uint8_t *junk = malloc(n + 1); rd_all(junk, n); free(junk); m[0] = 0x7f; }
+    if ((m[0] & 0x7f) == 35) {                           /* GenericEvent: skip its payload */
+        size_t n = (size_t)g32(m, 4) * 4; uint8_t junk[512];
+        while (n) { size_t k = n < sizeof junk ? n : sizeof junk; rd_all(junk, k); n -= k; }
+        m[0] = 0x7f;
+    }
 }
 /* Wait for the reply to the request with the sequence number `want` events met on the way are queued. */
 static int read_reply(uint16_t want, uint8_t hdr[32], uint8_t **extra) {
     for (;;) {
         uint8_t m[32]; read_msg(m);
         if (m[0] == 1) {
-            uint32_t n = g32(m, 4) * 4; *extra = NULL;
-            if (n) { *extra = malloc(n); rd_all(*extra, n); }
+            size_t n = (size_t)g32(m, 4) * 4; *extra = NULL;
+            if (n) { *extra = malloc(n); if (!*extra) { fprintf(stderr, "tint: out of memory\n"); exit(1); } rd_all(*extra, n); }
             memcpy(hdr, m, 32); return 1;
         }
         if (m[0] == 0) {
@@ -277,6 +281,7 @@ int x_open(int w, int h, const char *title, uint32_t bg) {
     if (scr_w > 0 && w > scr_w * 9 / 10) w = scr_w * 9 / 10;
     if (scr_h > 0 && h > scr_h * 9 / 10) h = scr_h * 9 / 10;
     x_w = w; x_h = h; x_fb = calloc((size_t)w * (size_t)h, 4);
+    if (!x_fb) { fprintf(stderr, "tint: out of memory\n"); return 1; }
     X.win = new_id(); X.gc = new_id();
     {
         uint8_t b[40]; memset(b, 0, sizeof b);
@@ -388,7 +393,8 @@ char *x_clip_get(void) {
     send_req(g, 24);
     uint8_t h[32], *ex; char *out = NULL;
     if (read_reply(X.seq, h, &ex)) {
-        if (h[1] == 8 && g32(h, 8) != X.a_proto) { uint32_t n = g32(h, 16); out = malloc(n + 1); memcpy(out, ex, n); out[n] = 0; }
+        size_t have = (size_t)g32(h, 4) * 4, n = g32(h, 16);       /* n comes from the server: it must fit in what was actually sent */
+        if (h[1] == 8 && g32(h, 8) != X.a_proto && ex && n <= have) { out = malloc(n + 1); if (out) { memcpy(out, ex, n); out[n] = 0; } }
         free(ex);
     }
     return out;
@@ -460,7 +466,9 @@ static void process_raw(const uint8_t *e) {
     case 22: {
         int w = (int)g16(e, 20), h = (int)g16(e, 22);
         if (w > 0 && h > 0 && (w != x_w || h != x_h)) {
-            free(x_fb); x_fb = calloc((size_t)w * (size_t)h, 4); x_w = w; x_h = h;
+            uint32_t *nf = calloc((size_t)w * (size_t)h, 4);
+            if (!nf) break;                                  
+            free(x_fb); x_fb = nf; x_w = w; x_h = h;
             ev.type = X_RESIZE; ev.w = w; ev.h = h; push(&ev);
         }
         break; }
