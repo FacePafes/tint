@@ -18,6 +18,7 @@ int tint_timeout = -1, tint_zoom = 1;
 static int again, closing, claimed, tab, want_cursor, grab;
 static uint32_t active, focus, focus0, first_focus, salt[8]; static int nsalt;
 static unsigned frame_no;
+static int over_clip, over_lay, over_salt, over_scroll, sn;   /* sn: open scroll regions */
 
 static int sc(void)  { return x_scale * tint_zoom; }
 static int pad(void) { return 4 * sc(); }                 /* gap between widgets, inner padding */
@@ -44,8 +45,11 @@ static uint32_t hstr(const char *s, size_t n) {
 }
 static uint32_t hptr(const void *p) { uint32_t h = (uint32_t)(((uintptr_t)p >> 2) * 2654435761u) ^ top_salt(); return h ? h : 1; }
 uint32_t tint_id(const char *s) { return hstr(s, strlen(s)); }
-void tint_push_id(int i) { if (nsalt < 8) { salt[nsalt] = (top_salt() * 16777619u) ^ ((uint32_t)i + 0x9e3779b9u); nsalt++; } }
-void tint_pop_id(void) { if (nsalt) nsalt--; }
+void tint_push_id(int i) {
+    if (nsalt < 8) { salt[nsalt] = (top_salt() * 16777619u) ^ ((uint32_t)i + 0x9e3779b9u); nsalt++; }
+    else over_salt++;
+}
+void tint_pop_id(void) { if (over_salt) over_salt--; else if (nsalt) nsalt--; }
 
 static struct { uint32_t id; unsigned used; int v[3]; } stt[64];   /* LRU table of int[3] */
 int *tint_state(uint32_t id) {
@@ -67,8 +71,8 @@ static TintRect isect(TintRect a, TintRect b) {
     return r;
 }
 static TintRect visible(TintRect r) { TintRect fb = { 0, 0, x_w, x_h }; return isect(isect(r, CLIP), fb); }
-void tint_push_clip(TintRect r) { if (cn < 15) { cs[cn + 1] = isect(cs[cn], r); cn++; } }
-void tint_pop_clip(void) { if (cn > 0) cn--; }
+void tint_push_clip(TintRect r) { if (cn < 15) { cs[cn + 1] = isect(cs[cn], r); cn++; } else over_clip++; }
+void tint_pop_clip(void) { if (over_clip) over_clip--; else if (cn > 0) cn--; }
 static int inside(TintRect r, int x, int y) { return x >= r.x && y >= r.y && x < r.x + r.w && y < r.y + r.h; }
 static int hovered(TintRect r) { return inside(r, tint_in.mx, tint_in.my) && inside(CLIP, tint_in.mx, tint_in.my); }
 
@@ -82,11 +86,12 @@ void tint_outline(TintRect r, uint32_t c) {
     tint_fill((TintRect){ r.x, r.y + b, b, r.h - 2 * b }, c);    tint_fill((TintRect){ r.x + r.w - b, r.y + b, b, r.h - 2 * b }, c);
 }
 void tint_line(int x0, int y0, int x1, int y1, uint32_t c) {   /* Bresenham each point is a tint_px(1) square */
-    int dx = abs(x1 - x0), dy = -abs(y1 - y0), sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1, err = dx + dy, t = bw();
+    long dx = labs((long)x1 - x0), dy = -labs((long)y1 - y0), err = dx + dy;   /* long: no int overflow on extreme coords */
+    int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1, t = bw();
     for (;;) {
         tint_fill((TintRect){ x0, y0, t, t }, c);
         if (x0 == x1 && y0 == y1) break;
-        int e2 = 2 * err;
+        long e2 = 2 * err;
         if (e2 >= dy) { err += dy; x0 += sx; }
         if (e2 <= dx) { err += dx; y0 += sy; }
     }
@@ -106,11 +111,20 @@ void tint_blit(int x, int y, int w, int h, const uint32_t *px) {
 /* UTF-8 */
 static int u8_next(const char *s, int i) { if (!s[i]) return i; i++; while ((s[i] & 0xC0) == 0x80) i++; return i; }
 static int u8_prev(const char *s, int i) { if (i <= 0) return 0; i--; while (i > 0 && (s[i] & 0xC0) == 0x80) i--; return i; }
-static int u8_dec(const char **p) {
-    const unsigned char *s = (const unsigned char *)*p; int c = s[0], n = 1;
-    if (c < 0x80) {} else if (c >= 0xF0) { c &= 7; n = 4; } else if (c >= 0xE0) { c &= 15; n = 3; } else if (c >= 0xC0) { c &= 31; n = 2; } else c = 0xFFFD;
-    for (int i = 1; i < n; i++) { if ((s[i] & 0xC0) != 0x80) { c = 0xFFFD; n = i; break; } c = c << 6 | (s[i] & 63); }
+static uint32_t u8_get(const char **p, const char *e, int *bad) {
+    const unsigned char *s = (const unsigned char *)*p; uint32_t c = s[0], min; int n, i;
+    if (bad) *bad = 0;
+    if (c < 0x80) { *p += 1; return c; }
+    if (c >= 0xC2 && c <= 0xDF) { n = 2; c &= 0x1F; min = 0x80; }
+    else if (c >= 0xE0 && c <= 0xEF) { n = 3; c &= 0x0F; min = 0x800; }
+    else if (c >= 0xF0 && c <= 0xF4) { n = 4; c &= 0x07; min = 0x10000; }
+    else goto invalid;
+    if (e - *p < n) goto invalid;
+    for (i = 1; i < n; i++) { if ((s[i] & 0xC0) != 0x80) goto invalid; c = c << 6 | (s[i] & 63); }
+    if (c < min || c > 0x10FFFF || (c >= 0xD800 && c <= 0xDFFF)) goto invalid;
     *p += n; return c;
+invalid:
+    *p += 1; if (bad) *bad = 1; return 0xFFFD;
 }
 
 /* font plumbing (see TintFont in tint.h this file contains no glyph data) */
@@ -121,13 +135,13 @@ static const uint8_t *lookup(uint32_t cp, int *cells) {
 }
 static int adv(uint32_t cp) { int n; lookup(cp, &n); return n * fw(); }          /* advance of one character, px */
 static int tw(const char *s, int nbytes) {                                       /* pixel width of the first nbytes bytes */
-    int w = 0; const char *p = s, *e = s + nbytes;
-    while (p < e && *p) w += adv((uint32_t)u8_dec(&p));
+    int w = 0; const char *p = s, *e = s + imax(nbytes, 0);
+    while (p < e && *p) w += adv(u8_get(&p, e, NULL));
     return w;
 }
 static int idx_at(const char *b, int px) {                                       /* byte offset of the character boundary nearest px */
-    int i = 0, x = 0;
-    while (b[i]) { const char *p = b + i; int w = adv((uint32_t)u8_dec(&p)); if (px < x + w / 2) break; x += w; i = (int)(p - b); }
+    int i = 0, x = 0; const char *e = b + strlen(b);
+    while (b[i]) { const char *p = b + i; int w = adv(u8_get(&p, e, NULL)); if (px < x + w / 2) break; x += w; i = (int)(p - b); }
     return i;
 }
 static void glyph(int x, int y, uint32_t cp, uint32_t c) {
@@ -151,9 +165,9 @@ static void glyph(int x, int y, uint32_t cp, uint32_t c) {
     }
 }
 int tint_text_n(int x, int y, const char *t, int n, uint32_t c) {
-    int x0 = x, h = fh(); const char *e = t + n;
+    int x0 = x, h = fh(); const char *e = t + imax(n, 0);
     while (t < e && *t) {
-        uint32_t cp = (uint32_t)u8_dec(&t); int a = adv(cp);
+        uint32_t cp = u8_get(&t, e, NULL); int a = adv(cp);
         if (x + a > CLIP.x && x < CLIP.x + CLIP.w && y + h > CLIP.y && y < CLIP.y + CLIP.h) glyph(x, y, cp, c);
         x += a;
     }
@@ -207,10 +221,14 @@ TintRect tint_avail(void) {                         /* what is left below the cu
 }
 void tint_region_begin(TintRect r) {                /* an independent flow layout inside any rectangle */
     tint_push_clip(r);
-    if (ln < 7) ln++;
+    if (ln >= 7) { over_lay++; return; }            /* too deep: widgets flow in the parent layout; never clobber it */
+    ln++;
     memset(&LY, 0, sizeof LY); LY.x = r.x; LY.w = r.w; LY.cy = r.y;
 }
-void tint_region_end(void) { if (ln > 0) { endrow(&LY); ln--; } tint_pop_clip(); }
+void tint_region_end(void) {
+    if (over_lay) over_lay--; else if (ln > 0) { endrow(&LY); ln--; }
+    tint_pop_clip();
+}
 
 /* interaction */
 unsigned tint_interact(uint32_t id, TintRect r) {
@@ -273,7 +291,7 @@ int tint_begin(void) {
     cn = 0; cs[0] = (TintRect){ 0, 0, x_w, x_h };
     tint_fill(cs[0], tint_theme.bg);
     ln = 0; memset(&L[0], 0, sizeof L[0]); L[0].x = pad(); L[0].w = imax(x_w - 2 * pad(), 0); L[0].cy = pad();
-    nsalt = 0; claimed = 0; focus0 = focus; first_focus = 0; want_cursor = X_CUR_ARROW; frame_no++;
+    nsalt = 0; over_clip = over_lay = over_salt = over_scroll = 0; sn = 0; claimed = 0; focus0 = focus; first_focus = 0; want_cursor = X_CUR_ARROW; frame_no++;
     return 1;
 }
 void tint_end(void) {
@@ -306,18 +324,21 @@ static int vscroll(uint32_t id, TintRect t, int content, int *off) {
 }
 
 /* scroll region */
-static struct { TintRect r; uint32_t id; int off0; } SC[4]; static int sn;
+static struct { TintRect r; uint32_t id; int off0; } SC[4];
 void tint_scroll_begin(const char *label, int h) {
     int b = bw(), p = pad(), sb = 8 * sc();
-    TintRect r = next_px(h * sc()); uint32_t id = tint_id(label); int *v = tint_state(id);
+    TintRect r = next_px(h * sc());
+    if (sn >= 4 || ln >= 7) { over_scroll++; return; }   /* too deep: contents flow unscrolled in the parent */
+    uint32_t id = tint_id(label); int *v = tint_state(id);
     v[0] = iclamp(v[0], 0, imax(v[1] - (r.h - 2 * b), 0));
     tint_fill(r, tint_theme.field);
-    if (sn < 4) { SC[sn].r = r; SC[sn].id = id; SC[sn].off0 = v[0]; sn++; }
+    SC[sn].r = r; SC[sn].id = id; SC[sn].off0 = v[0]; sn++;
     tint_push_clip((TintRect){ r.x + b, r.y + b, r.w - 2 * b, r.h - 2 * b });
-    if (ln < 7) ln++;
+    ln++;
     memset(&LY, 0, sizeof LY); LY.x = r.x + b + p; LY.w = imax(r.w - 2 * b - 2 * p - sb, 0); LY.cy = r.y + b + p - v[0];
 }
 void tint_scroll_end(void) {
+    if (over_scroll) { over_scroll--; return; }
     if (!sn || !ln) return;
     int b = bw(); sn--; TintRect r = SC[sn].r; int *v = tint_state(SC[sn].id);
     endrow(&LY);
@@ -440,6 +461,18 @@ int tint_list(const char **it, int n, int *sel, int rows) {
 }
 
 /* text input */
+/* Clipboard text is untrusted: make it valid UTF-8 with no control characters (C0, DEL, C1) before it can reach
+ * the caller's buffer. In place; the output is never longer than the input. */
+static void sanitize_paste(char *t) {
+    const char *p = t, *e = t + strlen(t); char *o = t;
+    while (p < e) {
+        const char *q = p; int bad; uint32_t cp = u8_get(&p, e, &bad);
+        if (bad) *o++ = '?';
+        else if (cp < 0x20 || cp == 0x7F || (cp >= 0x80 && cp < 0xA0)) *o++ = ' ';
+        else while (q < p) *o++ = *q++;
+    }
+    *o = 0;
+}
 static int is_sp(char c) { return isspace((unsigned char)c); }
 static int w_prev(const char *b, int i) { while (i > 0 && is_sp(b[i - 1])) i--; while (i > 0 && !is_sp(b[i - 1])) i--; return i; }
 static int w_next(const char *b, int i) { while (b[i] && !is_sp(b[i])) i++; while (b[i] && is_sp(b[i])) i++; return i; }
@@ -490,14 +523,17 @@ int tint_input(char *buf, size_t capz) {
                 if (ctrl && e->key == 'a') { anc = 0; cur = len; }
                 else if (ctrl && (e->key == 'c' || e->key == 'x')) {
                     if (hi > lo) {
-                        char *t = malloc((size_t)(hi - lo) + 1); memcpy(t, buf + lo, (size_t)(hi - lo)); t[hi - lo] = 0;
-                        x_clip_set(t); free(t);
-                        if (e->key == 'x') { len = ed_del(buf, len, lo, hi); cur = anc = lo; res |= TINT_CHANGED; }
+                        char *t = malloc((size_t)(hi - lo) + 1);
+                        if (t) {
+                            memcpy(t, buf + lo, (size_t)(hi - lo)); t[hi - lo] = 0;
+                            x_clip_set(t); free(t);
+                            if (e->key == 'x') { len = ed_del(buf, len, lo, hi); cur = anc = lo; res |= TINT_CHANGED; }
+                        }
                     }
                 } else if (ctrl && e->key == 'v') {
                     char *t = x_clip_get();
                     if (t) {
-                        for (char *q = t; *q; q++) if (*q == '\n' || *q == '\r' || *q == '\t') *q = ' ';
+                        sanitize_paste(t);
                         if (hi > lo) { len = ed_del(buf, len, lo, hi); cur = anc = lo; res |= TINT_CHANGED; }
                         int n = (int)strlen(t), room = cap - 1 - len;
                         if (n > room) { n = imax(room, 0); while (n > 0 && (t[n] & 0xC0) == 0x80) n--; }   /* don't cut a character */
