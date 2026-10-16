@@ -59,7 +59,7 @@ What you build with is small and fully public:
 | get mouse behaviour | `tint_interact` (hover / press / held / click), `tint_in` (raw pointer, buttons, wheel, keys) |
 | make your own containers | `tint_region_begin/end`: an independent flow layout in any rectangle: split panes, sidebars, cards, columns, overlays. Regions nest. |
 | draw | `tint_fill`, `tint_outline`, `tint_line`, `tint_circle`, `tint_blit` (raw pixels), `tint_text`, nested clipping |
-| draw anything at all | `x_fb`, the framebuffer itself: `x_w * x_h` pixels of `0x00RRGGBB`. Plot, render a game view, show an image, paint a terminal grid. |
+| draw anything at all | `x_fb`, the framebuffer itself: `x_w * x_h` pixels of `0x00RRGGBB`. Plot, render a game view, show an image, paint a terminal grid. A resize reallocates it: re-read `x_fb`, `x_w` and `x_h` every frame. |
 | keep state | your own variables (immediate mode), or `tint_state(id)` for 3 ints that persist between frames |
 | tell widgets apart | `tint_id`, `tint_push_id` / `tint_pop_id` |
 | match the look | `tint_theme` colours, `tint_px()` scaling, `tint_text_h()` / `tint_text_w()` metrics |
@@ -180,7 +180,8 @@ before `##` is shown), or wrap loops in `tint_push_id(i)` / `tint_pop_id()`.
 
 **Text input** supports arrows, Home/End, Ctrl+arrow word jumps, Backspace/Delete (Ctrl for words),
 Ctrl+A/C/X/V via the X clipboard, mouse selection, double-click to select a word, triple-click for
-all, and Enter (`TINT_SUBMIT`). It is UTF-8 safe, never overflows `cap`, and works with wide glyphs.
+all, and Enter (`TINT_SUBMIT`). It is UTF-8 safe, never overflows `cap`, and works with wide glyphs. Typed and pasted text is always
+valid UTF-8 with no control characters (a paste turns them into spaces, bad bytes into `?`).
 Tab cycles focus forward through inputs and lists; Esc drops focus.
 
 ```c
@@ -216,6 +217,46 @@ Events are `X_KEY` (keysym, modifiers and the UTF-8 text to insert), `X_BTN_DOWN
 - No blinking caret (so no timer is needed). Two clicks drained into one frame count as one.
 - Nested scroll regions give the wheel to the innermost one under the pointer.
 - X11 only (XWayland counts). Little-endian servers with 32 bits per pixel only.
+- One generated font holds at most 65,535 cells (its offset table is 16 bit).
+
+## Using it safely
+
+tint hands over the primitives and the memory behind them. It does its own checking where
+data comes from outside: the X server, other X clients and the clipboard.
+
+You supply the sizes There is no length argument to check, so these must be true:
+
+- `tint_input(buf, cap)`: `buf` holds a NUL within `cap` bytes and `cap` is its real size.
+- `tint_blit(x, y, w, h, rgb)`: `rgb` holds `w * h` pixels. Same for `x_set_icon(w, h, argb)` (sides up to 4096).
+- `tint_list`, `tint_tabs`, `tint_row`: the array holds `n` entries (`tint_row` reads at most 16).
+- Numbers are sane: finite floats for `tint_slider` / `tint_progress`, coordinates and radii that fit an `int` with room to spare.
+- Drawing does not clip before it works. `tint_line` costs time proportional to its length and `tint_circle` to its
+  radius squared, on screen or not, so clamp coordinates that come from data.
+- Never pass untrusted text as the format of `tint_labelf`. Use `tint_label(s)`; the compiler warns you too.
+- `tint_open(w, h, ...)` multiplies by `tint_zoom` and `x_scale` before the backend checks anything, so keep w and h small.
+
+Untrusted strings in `tint_label`, `tint_button`, `tint_check`, `tint_radio`, `tint_slider` and `tint_tabs`
+everything after `##` is hidden (and still part of the id). If a label comes from data you do not control, such as
+file names or network text, show it with `tint_text` or put it in a `tint_list`, which show the whole string.
+
+**What tint does do for you.**
+
+- `tint_input` never writes past `cap`, and text typed or pasted into it is valid UTF-8 with no control characters.
+- `tint_text_n(s, n)` never reads past `s + n`, and a font's `glyph` callback only ever sees valid Unicode scalar values.
+- Nesting past the limits (4 scroll regions, 7 regions and scroll regions together, 15 clips, 8 `tint_push_id`) is
+  ignored rather than an error the extra level has no effect and its contents flow in the parent.
+- Windows are limited to 16384 pixels a side and 64M pixels in all, whatever the window manager or another client asks for.
+
+**The back.**
+
+- `XEv.synthetic` is set when another client sent the event with `SendEvent`. Synthetic key, button and motion events are
+  dropped unless you set `x_allow_synthetic = 1` (automation and test tools need it). Close and resize messages from the
+  window manager are never dropped.
+- A clipboard reply is accepted only as the answer to own paste request: own window, `CLIPBOARD`, own property.
+  `x_trust_selection = 1` accepts any reply.
+- Ctrl+V can block up to 600 ms waiting for the clipboard owner. tint serves clipboards under 200 KB and reads at most 256 KB.
+- `x_open` ignores `SIGPIPE` for the whole process. If the X connection drops or `malloc` fails, the process calls
+  `exit(1)` with no hook, so keep your state saved as you go.
 
 ## Licence
 
