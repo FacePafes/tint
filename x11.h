@@ -24,10 +24,15 @@ typedef struct {
     int x, y, button; /* mouse events */
     int dy;           /* X_WHEEL: +1 up, -1 down */
     int w, h;         /* X_RESIZE */
+    int synthetic;    /* 1 if a another client sent this event (XSendEvent), not the X server's own input */
 } XEv;
 
 extern uint32_t *x_fb;   /* 0x00RRGGBB framebuffer, x_w * x_h */
 extern int x_w, x_h;
+extern int x_allow_synthetic; /* 0 (default): synthetic key/button/motion events are dropped. Set 1 otherwise */
+extern int x_trust_selection; /* 0 (default): SelectionNotify is accepted only as the answer to a paste request
+                                (our window, CLIPBOARD, our property or None). 1: accept any including unsolicited ones
+                                naming any property of a window. */
 extern int x_scale;      /* 1, 2 or 3: integer UI magnification suggested by the screen's pixel density */
 
 int  x_open(int w, int h, const char *title, uint32_t bg); /* 0 on success, error on stderr */
