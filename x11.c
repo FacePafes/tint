@@ -16,6 +16,9 @@
 #include <unistd.h>
 
 uint32_t *x_fb; int x_w, x_h, x_scale = 1;
+int x_allow_synthetic = 0, x_trust_selection = 0;
+#define MAXDIM 16384                 
+#define MAXPIX ((size_t)1 << 26)     
 static int scr_w, scr_h;
 
 #define QN 512
@@ -27,7 +30,7 @@ static struct {
     uint32_t a_proto, a_del, a_netname, a_utf8, a_clip, a_targets, a_prop, a_icon;
     char *clip; int clip_own;
     XEv q[QN]; int qh, qt;
-    int sel_done; uint32_t sel_prop;
+    int sel_done, sel_wait; uint32_t sel_prop;
     uint32_t font, cur[NCUR]; int cur_now;
 } X;
 
@@ -197,12 +200,14 @@ static void chg_prop(uint32_t win, uint32_t prop, uint32_t type, int fmt, const 
     } while (nbytes);
 }
 static void set_title(const char *t) {
+    if (!t) t = "";
     chg_prop(X.win, 39, 31, 8, t, strlen(t));
     chg_prop(X.win, X.a_netname, X.a_utf8, 8, t, strlen(t));
 }
 void x_set_title(const char *t) { set_title(t); }
 
 int x_open(int w, int h, const char *title, uint32_t bg) {
+    if (w < 1 || h < 1 || w > MAXDIM || h > MAXDIM) { fprintf(stderr, "tint: bad window size %dx%d\n", w, h); return 1; }
     signal(SIGPIPE, SIG_IGN);
     const char *disp = getenv("DISPLAY");
     if (!disp || !*disp) { fprintf(stderr, "tint: DISPLAY is not set (needs an X11 or XWayland session)\n"); return 1; }
@@ -223,7 +228,11 @@ int x_open(int w, int h, const char *title, uint32_t bg) {
     uint8_t hd[8]; rd_all(hd, 8);
     size_t blen = g16(hd, 6) * 4u;
     uint8_t *s = malloc(blen + 1); rd_all(s, blen);
-    if (hd[0] != 1) { fprintf(stderr, "tint: X server refused connection: %.*s\n", hd[1] < blen ? hd[1] : (int)blen, (char *)s); return 1; }
+    if (hd[0] != 1) {
+        char msg[256]; int k = 0, rl = hd[1] < blen ? hd[1] : (int)blen;   /* server text: never print raw control bytes */
+        for (int i = 0; i < rl && k < (int)sizeof msg - 1; i++) msg[k++] = (s[i] >= 0x20 && s[i] < 0x7f) ? (char)s[i] : '?';
+        msg[k] = 0; fprintf(stderr, "tint: X server refused connection: %s\n", msg); return 1;
+    }
     if (blen < 32) { fprintf(stderr, "tint: malformed X setup reply\n"); return 1; }
 
     X.base = g32(s, 4); X.mask = g32(s, 8); X.maxreq = g16(s, 18);
@@ -280,6 +289,11 @@ int x_open(int w, int h, const char *title, uint32_t bg) {
     w *= x_scale; h *= x_scale;                          /* keep the same number of characters per line */
     if (scr_w > 0 && w > scr_w * 9 / 10) w = scr_w * 9 / 10;
     if (scr_h > 0 && h > scr_h * 9 / 10) h = scr_h * 9 / 10;
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    if (w > MAXDIM) w = MAXDIM;
+    if (h > MAXDIM) h = MAXDIM;
+    if ((size_t)w * (size_t)h > MAXPIX) { fprintf(stderr, "tint: window too large\n"); return 1; }
     x_w = w; x_h = h; x_fb = calloc((size_t)w * (size_t)h, 4);
     if (!x_fb) { fprintf(stderr, "tint: out of memory\n"); return 1; }
     X.win = new_id(); X.gc = new_id();
@@ -333,7 +347,9 @@ void x_cursor(int shape) {
 }
 
 void x_set_icon(int w, int h, const uint32_t *argb) {
+    if (w < 1 || h < 1 || w > 4096 || h > 4096 || !argb) return;
     size_t n = (size_t)w * (size_t)h; uint8_t *b = malloc((n + 2) * 4);
+    if (!b) return;
     p32(b, 0, (uint32_t)w); p32(b, 4, (uint32_t)h);
     for (size_t i = 0; i < n; i++) p32(b, (int)(8 + i * 4), argb[i]);
     chg_prop(X.win, X.a_icon, 6, 32, b, (n + 2) * 4);
@@ -344,9 +360,11 @@ void x_close(void) { if (X.fd > 0) close(X.fd); }
 
 /* drawing */
 void x_present(void) {
+    if (x_w < 1 || x_h < 1) return;
     size_t stride = (size_t)x_w * 4;
     size_t maxb = (size_t)X.maxreq * 4 - 24;
-    size_t rows = maxb / stride; if (rows < 1) rows = 1;
+    size_t rows = maxb / stride;
+    if (rows < 1) return;                    
     for (int y = 0; y < x_h; y += (int)rows) {
         int h = (int)rows < x_h - y ? (int)rows : x_h - y;
         uint8_t hd[24]; memset(hd, 0, sizeof hd);
@@ -381,12 +399,13 @@ char *x_clip_get(void) {
     if (X.clip_own && X.clip) return strdup(X.clip);
     uint8_t b[24] = {0}; b[0] = 24; p16(b, 2, 6);
     p32(b, 4, X.win); p32(b, 8, X.a_clip); p32(b, 12, X.a_utf8); p32(b, 16, X.a_prop); p32(b, 20, 0);
-    X.sel_done = 0; send_req(b, 24);
+    X.sel_done = 0; X.sel_wait = 1; send_req(b, 24);
     long end = now_ms() + 600;
     while (!X.sel_done) {
-        long left = end - now_ms(); if (left <= 0) return NULL;
+        long left = end - now_ms(); if (left <= 0) { X.sel_wait = 0; return NULL; }
         if (poll_readable((int)left)) { uint8_t m[32]; read_msg(m); if (m[0] == 1 || m[0] == 0) continue; process_raw(m); }
     }
+    X.sel_wait = 0;
     if (!X.sel_prop) return NULL;
     uint8_t g[24] = {0}; g[0] = 20; g[1] = 1; p16(g, 2, 6);
     p32(g, 4, X.win); p32(g, 8, X.sel_prop); p32(g, 12, 0); p32(g, 16, 0); p32(g, 20, 65536);
@@ -440,7 +459,7 @@ static void key_event(const uint8_t *e) {
     if (ks >= 0xffe1 && ks <= 0xffee) return;   /* bare modifier */
     if (!ks) return;
     XEv ev; memset(&ev, 0, sizeof ev);
-    ev.type = X_KEY; ev.mod = mods_of(st);
+    ev.type = X_KEY; ev.mod = mods_of(st); ev.synthetic = (e[0] & 0x80) != 0;
     if ((ev.mod & M_CTRL) && ks >= 'A' && ks <= 'Z') ks += 32;
     ev.key = (int)ks;
     if (!(ev.mod & (M_CTRL | M_ALT))) {
@@ -448,12 +467,15 @@ static void key_event(const uint8_t *e) {
         if ((ks >= 0x20 && ks <= 0x7e) || (ks >= 0xa0 && ks <= 0xff)) cp = ks;
         else if ((ks & 0xff000000u) == 0x01000000u) cp = ks & 0xffffff;
         else if (ks == 0x20ac) cp = 0x20ac;
+        if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0) || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) cp = 0;  
         if (cp) ev.text[utf8_enc(cp, ev.text)] = 0;
     }
     push(&ev);
 }
 static void process_raw(const uint8_t *e) {
     int code = e[0] & 0x7f; XEv ev; memset(&ev, 0, sizeof ev);
+    ev.synthetic = (e[0] & 0x80) != 0;               
+    if (ev.synthetic && !x_allow_synthetic && (code == 2 || code == 4 || code == 5 || code == 6)) return;
     switch (code) {
     case 2: key_event(e); break;
     case 4: case 5: {
@@ -465,7 +487,7 @@ static void process_raw(const uint8_t *e) {
     case 12: if (g16(e, 16) == 0) { ev.type = X_EXPOSE; push(&ev); } break;
     case 22: {
         int w = (int)g16(e, 20), h = (int)g16(e, 22);
-        if (w > 0 && h > 0 && (w != x_w || h != x_h)) {
+        if (w > 0 && h > 0 && w <= MAXDIM && h <= MAXDIM && (size_t)w * (size_t)h <= MAXPIX && (w != x_w || h != x_h)) {
             uint32_t *nf = calloc((size_t)w * (size_t)h, 4);
             if (!nf) break;                                  
             free(x_fb); x_fb = nf; x_w = w; x_h = h;
@@ -477,7 +499,11 @@ static void process_raw(const uint8_t *e) {
         break;
     case 30: sel_request(e); break;
     case 29: X.clip_own = 0; break;
-    case 31: X.sel_done = 1; X.sel_prop = g32(e, 20); break;
+    case 31:       
+        if (x_trust_selection || (X.sel_wait && g32(e, 8) == X.win && g32(e, 12) == X.a_clip && (g32(e, 20) == X.a_prop || g32(e, 20) == 0))) {
+            X.sel_done = 1; X.sel_prop = g32(e, 20);
+        }
+        break;
     default: break;
     }
 }
