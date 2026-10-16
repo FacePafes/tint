@@ -3,6 +3,7 @@
 #include "x11.h"
 #include <errno.h>
 #include <netdb.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
 #include <stddef.h>
@@ -98,12 +99,27 @@ static int connect_display(const char *d, char *numbuf) {
     return fd;
 }
 
-/* MIT-MAGIC-COOKIE-1 from ~/.Xauthority 💀 */
-static int find_cookie(const char *num, uint8_t *cookie, int *clen) {
+/* MIT-MAGIC-COOKIE-1 from ~/.Xauthority 💀*/
+static int find_cookie(const char *num, int fd, uint8_t *cookie, int *clen) {
+    struct sockaddr_storage ss; socklen_t sl = sizeof ss;
+    int local = 0; const uint8_t *ip = NULL; unsigned iplen = 0, ipfam = 0;
+    if (getpeername(fd, (struct sockaddr *)&ss, &sl)) return 0;
+    if (ss.ss_family == AF_UNIX) local = 1;
+    else if (ss.ss_family == AF_INET) {
+        const struct sockaddr_in *a = (const struct sockaddr_in *)&ss;
+        ip = (const uint8_t *)&a->sin_addr; iplen = 4; ipfam = 0;       /* FamilyInternet */
+        if (ip[0] == 127) local = 1;
+    } else if (ss.ss_family == AF_INET6) {
+        const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)&ss;
+        ip = (const uint8_t *)&a->sin6_addr; iplen = 16; ipfam = 6;     /* FamilyInternet6 */
+        if (IN6_IS_ADDR_LOOPBACK(&a->sin6_addr)) local = 1;
+    } else return 0;
+
     const char *path = getenv("XAUTHORITY"); char buf[600];
     if (!path) { const char *h = getenv("HOME"); if (!h) return 0; snprintf(buf, sizeof buf, "%s/.Xauthority", h); path = buf; }
     FILE *f = fopen(path, "rb"); if (!f) return 0;
-    uint8_t *d = malloc(1 << 20); size_t n = fread(d, 1, 1 << 20, f); fclose(f);
+    uint8_t *d = malloc(1 << 20); if (!d) { fclose(f); return 0; }
+    size_t n = fread(d, 1, 1 << 20, f); fclose(f);
     char host[256] = ""; gethostname(host, sizeof host - 1);
     size_t p = 0; int best = -1;
     #define BE16(o) ((d[o] << 8) | d[(o) + 1])
@@ -120,9 +136,11 @@ static int find_cookie(const char *num, uint8_t *cookie, int *clen) {
         if (p > n) break;
         if (ml != 18 || memcmp(d + mp, "MIT-MAGIC-COOKIE-1", 18)) continue;
         if (nl && !(nl == strlen(num) && !memcmp(d + np, num, nl))) continue;
-        int score = 1;
-        if (fam == 65535) score = 2;
-        if (fam == 256 && al == strlen(host) && !memcmp(d + ap, host, al)) score = 3;
+        int score = 0;
+        if (fam == 65535) score = 1;                                                           /* FamilyWild: meant for any host */
+        else if (ip && fam == ipfam && al == iplen && !memcmp(d + ap, ip, iplen)) score = 2;   /* the peer's own address */
+        else if (local && fam == 256 && al == strlen(host) && !memcmp(d + ap, host, al)) score = 3;  /* FamilyLocal, this host */
+        if (!score) continue;                                                                  /* entry is for some other host: never send it */
         if (score > best && dl <= 64) { best = score; memcpy(cookie, d + dp, dl); *clen = (int)dl; }
     }
     free(d);
@@ -189,7 +207,7 @@ int x_open(int w, int h, const char *title, uint32_t bg) {
     if (X.fd < 0) { fprintf(stderr, "tint: cannot connect to X display '%s'\n", disp); return 1; }
 
     uint8_t cookie[64]; int cl = 0;
-    if (!find_cookie(num, cookie, &cl)) cl = 0;
+    if (!find_cookie(num, X.fd, cookie, &cl)) cl = 0;
     int name_len = cl ? 18 : 0;
     uint8_t req[12 + 20 + 64 + 8]; memset(req, 0, sizeof req);
     req[0] = 'l'; p16(req, 2, 11); p16(req, 4, 0);
@@ -201,17 +219,18 @@ int x_open(int w, int h, const char *title, uint32_t bg) {
     uint8_t hd[8]; rd_all(hd, 8);
     size_t blen = g16(hd, 6) * 4u;
     uint8_t *s = malloc(blen + 1); rd_all(s, blen);
-    if (hd[0] != 1) { fprintf(stderr, "tint: X server refused connection: %.*s\n", hd[1], (char *)s); return 1; }
+    if (hd[0] != 1) { fprintf(stderr, "tint: X server refused connection: %.*s\n", hd[1] < blen ? hd[1] : (int)blen, (char *)s); return 1; }
+    if (blen < 32) { fprintf(stderr, "tint: malformed X setup reply\n"); return 1; }
 
     X.base = g32(s, 4); X.mask = g32(s, 8); X.maxreq = g16(s, 18);
     int nscreens = s[20], nfmt = s[21], kmin = s[26];
     if (s[22] != 0) { fprintf(stderr, "tint: big-endian X servers are not supported\n"); return 1; }
     X.kmin = kmin;
     size_t o = 32 + (size_t)pad4((int)g16(s, 16));
+    if (nscreens < 1 || o + (size_t)nfmt * 8 + 40 > blen) { fprintf(stderr, "tint: malformed X setup reply\n"); return 1; }
     int fmt_bpp[256] = {0};
     for (int i = 0; i < nfmt; i++) fmt_bpp[s[o + i * 8]] = s[o + i * 8 + 1];
     o += (size_t)nfmt * 8;
-    if (nscreens < 1) return 1;
     X.root = g32(s, (int)o); X.depth = s[o + 38];
     scr_w = (int)g16(s, (int)o + 20); scr_h = (int)g16(s, (int)o + 22);
     {   /* pixel density from the screen's reported size; 0 mm (unknown) leaves the scale at 1 */
@@ -245,8 +264,10 @@ int x_open(int w, int h, const char *title, uint32_t bg) {
         uint8_t h[32], *ex;
         if (read_reply(X.seq, h, &ex)) {
             X.kspk = h[1]; size_t cnt = g32(h, 4);
-            X.ks = malloc(cnt * 4 + 4);
-            for (size_t i = 0; i < cnt; i++) X.ks[i] = g32(ex, (int)(i * 4));
+            if (ex && X.kspk > 0 && cnt >= (size_t)(256 - kmin) * (size_t)X.kspk) {   /* every (code, idx) keysym() can ask for must exist */
+                X.ks = malloc(cnt * 4 + 4);
+                if (X.ks) for (size_t i = 0; i < cnt; i++) X.ks[i] = g32(ex, (int)(i * 4));
+            }
             free(ex);
         }
     }
