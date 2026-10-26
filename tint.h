@@ -20,6 +20,7 @@
  * IDS. A widget's identity is a hash of its label (inputs/lists: of their data pointer).
  * Two widgets with the same label need different ids: give them a hidden suffix, "Ok##a",
  * "Ok##b" (only the text before "##" is shown), or wrap loops in tint_push_id(i)/tint_pop_id().
+ * With tint_raw_labels = 1 nothing is parsed: the whole string is shown and hashed.
  *
  * LGPL-3.0-or-later. */
 #ifndef TINT_H
@@ -49,11 +50,23 @@ typedef struct {                      /* this frame's input; read only for you *
     int clicks;                       /* 1, 2, 3... consecutive quick clicks of the last press */
     int wheel;                        /* +up / -down notches not yet consumed by a widget */
     XEv keys[32]; int nkeys;          /* X_KEY events this frame (Tab is consumed by the library) */
+    int focused;                      /* window has keyboard focus 1 at open, kept current only when x_focus = 1 */
 } TintIn;
 extern TintIn tint_in;
 
 extern int tint_timeout;               /* ms: -1 (default) sleeps until input; >=0 also produces a frame after that long (animation) */
 extern int tint_zoom;                  /* integer UI zoom on top of x_scale; set before tint_open() */
+extern int tint_raw_labels;            /* 1: no "##" parsing anywhere the id hashes the whole string */
+extern int tint_settle;                /* 1: any click/release/key this frame schedules one more frame */
+extern int tint_list_activate;         /* 1: tint_list also returns TINT_SUBMIT on double-click or Enter (TINT_CHANGED still means selection changed) */
+extern int tint_block;                 /* 1: widgets see no hover/click/wheel/keys/Tab (draw still works) e.g. the UI behind a modal */
+extern int tint_slider_int;            /* 1: sliders print "%d" and snap to integers */
+extern int tint_ellipsis;              /* 1: clipped label/radio/check/list text ends in "..." instead of a hard cut */
+extern int tint_fill_rest;             /* 1: next tint_list / tint_scroll_begin ignores rows/height and fills the space tint_avail would report */
+extern int tint_square;                /* 1: next cell is h x h */
+extern int tint_focus_next;            /* 1: next focusable widget (input/list) takes keyboard focus */
+extern int tint_h;                     /* logical px; 0 = unchanged. Overrides the height of the next cell/widget */
+extern const char *tint_hint;          /* NULL = none. Next tint_input shows this dim while empty and unfocused */
 
 /* frame */
 int  tint_open(int w, int h, const char *title);   /* logical px; 0 on success */
@@ -62,6 +75,8 @@ void tint_end(void);                               /* present the frame */
 void tint_close(void);
 void tint_redraw(void);                            /* make the next tint_begin() return without waiting */
 int  tint_px(int logical);                         /* logical -> physical */
+int  tint_lpx(int physical);                       /* physical -> logical (inverse of tint_px) */
+long tint_now_ms(void);                            /* monotonic clock, milliseconds */
 
 /* layout: widgets flow top to bottom, full width */
 void tint_row(int n, const int *widths);           /* next n widgets share one row; widths[] in logical px, 0 = stretch,
@@ -111,5 +126,6 @@ int  tint_text(int x, int y, const char *s, uint32_t c);    /* current font * ti
 int  tint_text_n(int x, int y, const char *s, int nbytes, uint32_t c);
 int  tint_text_h(void);                           /* line height of the current font, physical px */
 int  tint_text_w(const char *s);                   /* width in physical px */
+int  tint_text_c(TintRect r, const char *s, uint32_t c);   /* s centered in r, clipped to r, no "##" parsing, returns its width */
 void tint_push_clip(TintRect r);  void tint_pop_clip(void);   /* nested; intersects with the current clip */
 #endif
