@@ -54,6 +54,12 @@ typedef struct {                      /* this frame's input; read only for you *
 } TintIn;
 extern TintIn tint_in;
 
+/* Held keys. Maintained only while x_keyup = 1 (set it before tint_open()) otherwise both return 0.
+ * Keysyms are the ones in tint_in.keys (K_* or ASCII letters match either case). Modifier keys alone are not tracked.
+ * Auto-repeat does not toggle anything. The held set is cleared when the window loses focus (needs x_focus = 1). */
+int tint_key_down(int keysym);         /* 1 while the key is held */
+int tint_key_released(int keysym);     /* 1 for the one frame in which it was released */
+
 extern int tint_timeout;               /* ms: -1 (default) sleeps until input; >=0 also produces a frame after that long (animation) */
 extern int tint_zoom;                  /* integer UI zoom on top of x_scale; set before tint_open() */
 extern int tint_raw_labels;            /* 1: no "##" parsing anywhere the id hashes the whole string */
@@ -62,9 +68,12 @@ extern int tint_list_activate;         /* 1: tint_list also returns TINT_SUBMIT 
 extern int tint_block;                 /* 1: widgets see no hover/click/wheel/keys/Tab (draw still works) e.g. the UI behind a modal */
 extern int tint_slider_int;            /* 1: sliders print "%d" and snap to integers */
 extern int tint_ellipsis;              /* 1: clipped label/radio/check/list text ends in "..." instead of a hard cut */
-extern int tint_fill_rest;             /* 1: next tint_list / tint_scroll_begin ignores rows/height and fills the space tint_avail would report */
+extern int tint_fill_rest;             /* 1: next tint_list / tint_scroll_begin ignores rows/height and fills the space tint_avail would report.
+                                          With tint_h > 0 too, tint_h is instead the height (logical px) of what you place below it: the fill stops
+                                          short so a cell of that height fits under it (the usual gap included) */
 extern int tint_square;                /* 1: next cell is h x h */
-extern int tint_focus_next;            /* 1: next focusable widget (input/list) takes keyboard focus */
+extern int tint_focus_next;            /* 1: next focusable widget (input/list) takes keyboard focus. Set after that widget was already drawn this
+                                          frame and the library runs one more frame by itself, so it still lands without tint_settle */
 extern int tint_h;                     /* logical px; 0 = unchanged. Overrides the height of the next cell/widget */
 extern const char *tint_hint;          /* NULL = none. Next tint_input shows this dim while empty and unfocused */
 
