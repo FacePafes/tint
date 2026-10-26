@@ -17,6 +17,7 @@
 
 uint32_t *x_fb; int x_w, x_h, x_scale = 1;
 int x_allow_synthetic = 0, x_trust_selection = 0;
+int x_keyup = 0, x_focus = 0, x_fixed_size = 0;
 #define MAXDIM 16384                 
 #define MAXPIX ((size_t)1 << 26)     
 static int scr_w, scr_h;
@@ -32,6 +33,7 @@ static struct {
     XEv q[QN]; int qh, qt;
     int sel_done, sel_wait; uint32_t sel_prop;
     uint32_t font, cur[NCUR]; int cur_now;
+    XEv rel; int rel_pending, rel_code; uint32_t rel_time;   /* a KeyRelease held back until we know it is not auto-repeat */
 } X;
 
 static void p16(uint8_t *b, int o, unsigned v) { b[o] = v & 255; b[o + 1] = (v >> 8) & 255; }
@@ -305,8 +307,8 @@ int x_open(int w, int h, const char *title, uint32_t bg) {
         p32(b, 24, 0);                       /* visual: CopyFromParent */
         p32(b, 28, 0x2 | 0x800);             /* back-pixel | event-mask */
         p32(b, 32, bg);
-        /* key, btn press/release, leave, pointer motion, btn motion, expose, structure */
-        p32(b, 36, 1 | 4 | 8 | 32 | 64 | (1 << 13) | (1 << 15) | (1 << 17));
+        /* key, btn press/release, leave, pointer motion, btn motion, expose, structure (+ key release, focus change) */
+        p32(b, 36, 1 | 4 | 8 | 32 | 64 | (1 << 13) | (1 << 15) | (1 << 17) | (x_keyup ? 2u : 0u) | (x_focus ? 1u << 21 : 0u));
         send_req(b, 40);
     }
     {
@@ -316,6 +318,11 @@ int x_open(int w, int h, const char *title, uint32_t bg) {
     set_title(title);
     chg_prop(X.win, 67, 31, 8, "tint\0tint", sizeof "tint\0Tint");           /* WM_CLASS */
     chg_prop(X.win, X.a_proto, 4, 32, &X.a_del, 4);            /* WM_PROTOCOLS: WM_DELETE_WINDOW */
+    if (x_fixed_size) {                                        /* WM_NORMAL_HINTS: PMinSize | PMaxSize = the size we opened */
+        uint8_t sh[72]; memset(sh, 0, sizeof sh);
+        p32(sh, 0, 16 | 32); p32(sh, 20, (uint32_t)w); p32(sh, 24, (uint32_t)h); p32(sh, 28, (uint32_t)w); p32(sh, 32, (uint32_t)h);
+        chg_prop(X.win, 40, 41, 32, sh, sizeof sh);            /* atoms 40 = WM_NORMAL_HINTS, 41 = WM_SIZE_HINTS */
+    }
 
     /* cursors come from the standard "cursor" font (errors, if any, are ignored) */
     {
@@ -434,7 +441,7 @@ static int utf8_enc(uint32_t c, char *o) {
     if (c < 0x10000) { o[0] = (char)(0xE0 | c >> 12); o[1] = (char)(0x80 | ((c >> 6) & 63)); o[2] = (char)(0x80 | (c & 63)); return 3; }
     o[0] = (char)(0xF0 | c >> 18); o[1] = (char)(0x80 | ((c >> 12) & 63)); o[2] = (char)(0x80 | ((c >> 6) & 63)); o[3] = (char)(0x80 | (c & 63)); return 4;
 }
-static void key_event(const uint8_t *e) {
+static int key_ev(const uint8_t *e, XEv *out) {      /* decode a Key event; 0 if it is to be ignored */
     int code = e[1]; unsigned st = g16(e, 28);
     int shift = st & 1, lock = st & 2, numlock = st & 16;
     int base = (st & 0x80) ? 2 : 0;
@@ -456,8 +463,8 @@ static void key_event(const uint8_t *e) {
         static const uint32_t m[] = { K_HOME, K_LEFT, K_UP, K_RIGHT, K_DOWN, K_PGUP, K_PGDN, K_END, 0, 0, 0, K_DELETE };
         uint32_t r = m[ks - 0xff95]; if (r) ks = r;
     }
-    if (ks >= 0xffe1 && ks <= 0xffee) return;   /* bare modifier */
-    if (!ks) return;
+    if (ks >= 0xffe1 && ks <= 0xffee) return 0; /* bare modifier */
+    if (!ks) return 0;
     XEv ev; memset(&ev, 0, sizeof ev);
     ev.type = X_KEY; ev.mod = mods_of(st); ev.synthetic = (e[0] & 0x80) != 0;
     if ((ev.mod & M_CTRL) && ks >= 'A' && ks <= 'Z') ks += 32;
@@ -470,14 +477,23 @@ static void key_event(const uint8_t *e) {
         if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0) || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) cp = 0;  
         if (cp) ev.text[utf8_enc(cp, ev.text)] = 0;
     }
-    push(&ev);
+    *out = ev; return 1;
 }
+static void flush_release(void) { if (X.rel_pending) { push(&X.rel); X.rel_pending = 0; } }
 static void process_raw(const uint8_t *e) {
     int code = e[0] & 0x7f; XEv ev; memset(&ev, 0, sizeof ev);
     ev.synthetic = (e[0] & 0x80) != 0;               
-    if (ev.synthetic && !x_allow_synthetic && (code == 2 || code == 4 || code == 5 || code == 6)) return;
+    /* X reports auto-repeat as KeyRelease + KeyPress with the same keycode and timestamp: drop the release, keep the press */
+    if (X.rel_pending) { if (code == 2 && e[1] == X.rel_code && g32(e, 4) == X.rel_time) X.rel_pending = 0; else flush_release(); }
+    if (ev.synthetic && !x_allow_synthetic && (code == 2 || code == 3 || code == 4 || code == 5 || code == 6)) return;
     switch (code) {
-    case 2: key_event(e); break;
+    case 2: { XEv k; if (key_ev(e, &k)) push(&k); break; }
+    case 3:
+        if (x_keyup) { XEv k; if (key_ev(e, &k)) { k.type = X_KEY_UP; k.text[0] = 0; X.rel = k; X.rel_pending = 1; X.rel_code = e[1]; X.rel_time = g32(e, 4); } }
+        break;
+    case 9: case 10:
+        if (x_focus && e[8] != 1 && e[8] != 2 && e[1] < 5) { ev.type = code == 9 ? X_FOCUS_IN : X_FOCUS_OUT; push(&ev); }
+        break;
     case 4: case 5: {
         int b = e[1]; ev.x = (int16_t)g16(e, 24); ev.y = (int16_t)g16(e, 26); ev.mod = mods_of(g16(e, 28));
         if (b == 4 || b == 5) { if (code == 4) { ev.type = X_WHEEL; ev.dy = b == 4 ? 1 : -1; push(&ev); } break; }
@@ -511,6 +527,7 @@ int x_wait(XEv *out, int timeout_ms) {
     long end = now_ms() + timeout_ms;
     for (;;) {
         if (X.qh != X.qt) { *out = X.q[X.qh]; X.qh = (X.qh + 1) % QN; return 1; }
+        if (X.rel_pending && !poll_readable(2)) { flush_release(); continue; }   /* no auto-repeat press followed: a real release */
         long left = end - now_ms(); if (left < 0) left = 0;
         if (!poll_readable((int)left)) return 0;
         uint8_t m[32]; read_msg(m);
