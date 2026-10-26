@@ -19,7 +19,8 @@ enum { X_CUR_CROSS = 34, X_CUR_HAND = 60, X_CUR_ARROW = 68, X_CUR_HSIZE = 108,
 
 typedef struct {
     int type;
-    int key;          /* X_KEY: keysym (letters lowercased when Ctrl is held) */
+    int key;          /* X_KEY / X_KEY_UP: keysym (letters lowercased when Ctrl is held) */
+    int code;         /* X_KEY / X_KEY_UP: hardware keycode a press and its release share it even if the keysym changed (Shift) */
     unsigned mod;     /* M_* bits */
     char text[8];     /* X_KEY: UTF-8 to insert, "" if the key is not text */
     int x, y, button; /* mouse events */
