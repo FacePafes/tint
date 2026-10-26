@@ -13,6 +13,9 @@ TintTheme tint_theme = { .bg = 0x1e1f22, .panel = 0x2d2f34, .field = 0x17181b, .
                        .hot = 0x3a3d44, .active = 0x4a4e57 };
 TintIn tint_in;
 int tint_timeout = -1, tint_zoom = 1;
+int tint_raw_labels, tint_settle, tint_list_activate, tint_block, tint_slider_int, tint_ellipsis;
+int tint_fill_rest, tint_square, tint_focus_next, tint_h;
+const char *tint_hint;
 
 #define BIG 3600000
 static int again, closing, claimed, tab, want_cursor, grab;
@@ -29,9 +32,10 @@ static int fw(void)  { return F->w * sc(); }              /* one character cell,
 static int fh(void)  { return F->h * sc(); }              /* line height, px */
 static int rowh(void){ return fh() + 2 * pad(); }         /* height of a standard widget */
 int  tint_px(int n)   { return n * sc(); }
+int  tint_lpx(int n)  { return n / sc(); }
 void tint_redraw(void){ again = 1; }
 
-static long now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000L + t.tv_nsec / 1000000L; }
+long tint_now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000L + t.tv_nsec / 1000000L; }
 static int imin(int a, int b) { return a < b ? a : b; }
 static int imax(int a, int b) { return a > b ? a : b; }
 static int iclamp(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
@@ -74,7 +78,7 @@ static TintRect visible(TintRect r) { TintRect fb = { 0, 0, x_w, x_h }; return i
 void tint_push_clip(TintRect r) { if (cn < 15) { cs[cn + 1] = isect(cs[cn], r); cn++; } else over_clip++; }
 void tint_pop_clip(void) { if (over_clip) over_clip--; else if (cn > 0) cn--; }
 static int inside(TintRect r, int x, int y) { return x >= r.x && y >= r.y && x < r.x + r.w && y < r.y + r.h; }
-static int hovered(TintRect r) { return inside(r, tint_in.mx, tint_in.my) && inside(CLIP, tint_in.mx, tint_in.my); }
+static int hovered(TintRect r) { return !tint_block && inside(r, tint_in.mx, tint_in.my) && inside(CLIP, tint_in.mx, tint_in.my); }
 
 void tint_fill(TintRect r, uint32_t c) {
     r = visible(r);
@@ -175,11 +179,18 @@ int tint_text_n(int x, int y, const char *t, int n, uint32_t c) {
 }
 int tint_text(int x, int y, const char *t, uint32_t c) { return tint_text_n(x, y, t, (int)strlen(t), c); }
 int tint_text_w(const char *t) { return tw(t, (int)strlen(t)); }
-static int llen(const char *s) { const char *h = strstr(s, "##"); return h ? (int)(h - s) : (int)strlen(s); }   /* visible part of a label */
+static int llen(const char *s) { const char *h = tint_raw_labels ? NULL : strstr(s, "##"); return h ? (int)(h - s) : (int)strlen(s); }   /* visible part of a label */
 static void text_c(TintRect r, const char *s, int n, uint32_t c) {                                                 /* centered, clipped to r */
     tint_push_clip(r);
     tint_text_n(r.x + (r.w - tw(s, n)) / 2, r.y + (r.h - fh()) / 2, s, n, c);
     tint_pop_clip();
+}
+int tint_text_c(TintRect r, const char *s, uint32_t c) { int n = (int)strlen(s); text_c(r, s, n, c); return tw(s, n); }
+static void text_fit(int x, int y, int maxw, const char *s, int n, uint32_t c) {   /* left aligned: "..." if tint_ellipsis and too wide */
+    if (!tint_ellipsis || tw(s, n) <= maxw) { tint_text_n(x, y, s, n, c); return; }
+    int room = maxw - tw("...", 3), w = 0; const char *p = s, *e = s + n;
+    while (p < e && *p) { const char *q = p; int a = adv(u8_get(&q, e, NULL)); if (w + a > room) break; w += a; p = q; }
+    tint_text_n(x, y, s, (int)(p - s), c); tint_text_n(x + w, y, "...", 3, c);
 }
 
 /* layout */
@@ -202,12 +213,21 @@ static void setrow(Lay *l, int n, const int *w) {
 static void endrow(Lay *l) { if (l->i > 0) { l->cy = l->ry + l->rh + pad(); l->i = 0; } l->n = 0; }
 static TintRect next_px(int h) {
     Lay *l = &LY;
+    if (tint_h > 0) h = tint_h * sc();
+    tint_h = 0;
     if (l->n == 0) setrow(l, 1, NULL);
     if (l->i == 0) { l->ry = l->cy; l->rh = 0; }
     TintRect r = { l->cx[l->i], l->ry, l->cw[l->i], h };
+    if (tint_square) { r.w = h; tint_square = 0; }
     l->rh = imax(l->rh, h);
     if (++l->i >= l->n) { l->cy = l->ry + l->rh + pad(); l->i = 0; l->n = 0; }
     return r;
+}
+static int take_fill(void) {                        /* tint_fill_rest: height from the next cell's top to the clip bottom, else -1 */
+    if (!tint_fill_rest) return -1;
+    tint_fill_rest = 0; tint_h = 0;
+    Lay *l = &LY; int top = l->i ? l->ry : l->cy;
+    return imax(CLIP.y + CLIP.h - top, 0);
 }
 void tint_row(int n, const int *w) { endrow(&LY); setrow(&LY, n, w); }
 void tint_space(int px) { endrow(&LY); LY.cy += px * sc(); }
@@ -232,6 +252,7 @@ void tint_region_end(void) {
 
 /* interaction */
 unsigned tint_interact(uint32_t id, TintRect r) {
+    if (tint_block) return 0;
     int in = hovered(r); unsigned f = 0;
     if (in && (!active || active == id)) f |= TINT_HOVER;
     if (in && tint_in.pressed && !active) { active = id; f |= TINT_PRESS; }
@@ -240,7 +261,10 @@ unsigned tint_interact(uint32_t id, TintRect r) {
     return f;
 }
 /* Tab cycles keyboard focus through focusable widgets (inputs, lists). */
+static int nkeys(void) { return tint_block ? 0 : tint_in.nkeys; }
 static void focusable(uint32_t id) {
+    if (tint_block) return;
+    if (tint_focus_next) { focus = id; claimed = 1; tint_focus_next = 0; }
     if (!first_focus) first_focus = id;
     if (tab == 2 || (tab == 1 && !focus)) { focus = id; tab = 0; }
     else if (tab == 1 && focus == id) tab = 2;
@@ -251,7 +275,7 @@ int tint_open(int w, int h, const char *title) {
     if (!F) { fprintf(stderr, "tint: no font set; call tint_set_font() before tint_open()\n"); return 1; }
     if (tint_zoom < 1) tint_zoom = 1;
     if (x_open(w * tint_zoom, h * tint_zoom, title, tint_theme.bg)) return 1;
-    again = 1; return 0;
+    again = 1; tint_in.focused = 1; return 0;
 }
 void tint_close(void) { free(x_fb); x_fb = NULL; x_close(); }
 
@@ -271,7 +295,7 @@ int tint_begin(void) {
             tint_in.mx = e.x; tint_in.my = e.y;
             if (e.button == 3) tint_in.rclick = 1;
             if (e.button == 1) {
-                static long t0; static int x0, y0; long t = now_ms();
+                static long t0; static int x0, y0; long t = tint_now_ms();
                 tint_in.clicks = (t - t0 < 400 && abs(e.x - x0) < tint_px(4) && abs(e.y - y0) < tint_px(4)) ? tint_in.clicks + 1 : 1;
                 t0 = t; x0 = e.x; y0 = e.y; tint_in.down = tint_in.pressed = 1;
             }
@@ -280,6 +304,8 @@ int tint_begin(void) {
             tint_in.mx = e.x; tint_in.my = e.y;
             if (e.button == 1) { tint_in.down = 0; tint_in.released = 1; }
             break;
+        case X_FOCUS_IN: tint_in.focused = 1; break;
+        case X_FOCUS_OUT: tint_in.focused = 0; break;
         case X_KEY:
             if (e.key == K_TAB && !(e.mod & (M_CTRL | M_ALT))) tab = 1;
             else if (tint_in.nkeys < 32) tint_in.keys[tint_in.nkeys++] = e;
@@ -295,6 +321,7 @@ int tint_begin(void) {
     return 1;
 }
 void tint_end(void) {
+    if (tint_settle && (tint_in.pressed || tint_in.released || tint_in.rclick || tint_in.nkeys || tab)) again = 1;
     if (tint_in.pressed && !claimed) focus = 0;      /* click on nothing focusable: drop focus */
     if (tab == 2) focus = first_focus;              /* Tab past the last widget wraps around */
     tab = 0;
@@ -327,7 +354,8 @@ static int vscroll(uint32_t id, TintRect t, int content, int *off) {
 static struct { TintRect r; uint32_t id; int off0; } SC[4];
 void tint_scroll_begin(const char *label, int h) {
     int b = bw(), p = pad(), sb = 8 * sc();
-    TintRect r = next_px(h * sc());
+    int fr = take_fill();
+    TintRect r = next_px(fr >= 0 ? fr : h * sc());
     if (sn >= 4 || ln >= 7) { over_scroll++; return; }   /* too deep: contents flow unscrolled in the parent */
     uint32_t id = tint_id(label); int *v = tint_state(id);
     v[0] = iclamp(v[0], 0, imax(v[1] - (r.h - 2 * b), 0));
@@ -357,7 +385,7 @@ void tint_scroll_end(void) {
 /* simple widgets */
 void tint_label(const char *s) {
     TintRect r = next_px(rowh());
-    tint_push_clip(r); tint_text_n(r.x, r.y + (r.h - fh()) / 2, s, llen(s), tint_theme.text); tint_pop_clip();
+    tint_push_clip(r); text_fit(r.x, r.y + (r.h - fh()) / 2, r.w, s, llen(s), tint_theme.text); tint_pop_clip();
 }
 void tint_labelf(const char *fmt, ...) {
     char b[512]; va_list a; va_start(a, fmt); vsnprintf(b, sizeof b, fmt, a); va_end(a); tint_label(b);
@@ -377,7 +405,7 @@ int tint_check(const char *label, int *v) {
     TintRect bx = { r.x, r.y + (r.h - bs) / 2, bs, bs };
     tint_fill(bx, tint_theme.field); tint_outline(bx, (f & TINT_HOVER) ? tint_theme.accent : tint_theme.border);
     if (*v) tint_fill((TintRect){ bx.x + 3 * s, bx.y + 3 * s, bs - 6 * s, bs - 6 * s }, tint_theme.accent);
-    tint_push_clip(r); tint_text_n(r.x + bs + pad(), r.y + (r.h - fh()) / 2, label, llen(label), tint_theme.text); tint_pop_clip();
+    tint_push_clip(r); text_fit(r.x + bs + pad(), r.y + (r.h - fh()) / 2, r.w - bs - pad(), label, llen(label), tint_theme.text); tint_pop_clip();
     return !!(f & TINT_CLICK);
 }
 int tint_radio(const char *label, int *v, int val) {
@@ -387,7 +415,7 @@ int tint_radio(const char *label, int *v, int val) {
     tint_circle(cx, cy, rad, (f & TINT_HOVER) ? tint_theme.accent : tint_theme.border);
     tint_circle(cx, cy, rad - s, tint_theme.field);
     if (*v == val) tint_circle(cx, cy, rad - 3 * s, tint_theme.accent);
-    tint_push_clip(r); tint_text_n(r.x + 2 * rad + pad(), r.y + (r.h - fh()) / 2, label, llen(label), tint_theme.text); tint_pop_clip();
+    tint_push_clip(r); text_fit(r.x + 2 * rad + pad(), r.y + (r.h - fh()) / 2, r.w - 2 * rad - pad(), label, llen(label), tint_theme.text); tint_pop_clip();
     return res;
 }
 int tint_slider(const char *label, float *v, float lo, float hi) {
@@ -396,13 +424,15 @@ int tint_slider(const char *label, float *v, float lo, float hi) {
         float t = (float)(tint_in.mx - (r.x + b)) / (float)(r.w - 2 * b);
         t = t < 0 ? 0 : t > 1 ? 1 : t;
         float nv = lo + t * (hi - lo);
+        if (tint_slider_int) { nv = (float)(long)(nv + (nv < 0 ? -0.5f : 0.5f)); nv = nv < lo ? lo : nv > hi ? hi : nv; }
         if (nv != *v) { *v = nv; res = 1; }
     }
     float t = hi > lo ? (*v - lo) / (hi - lo) : 0; t = t < 0 ? 0 : t > 1 ? 1 : t;
     tint_fill(r, tint_theme.field);
     tint_fill((TintRect){ r.x + b, r.y + b, (int)((r.w - 2 * b) * t), r.h - 2 * b }, tint_theme.accent);
     tint_outline(r, (f & TINT_HOVER) ? tint_theme.dim : tint_theme.border);
-    char buf[128]; int n = snprintf(buf, sizeof buf, "%.*s: %.2f", llen(label), label, *v);
+    char buf[128]; int n = tint_slider_int ? snprintf(buf, sizeof buf, "%.*s: %d", llen(label), label, (int)(*v + (*v < 0 ? -0.5f : 0.5f)))
+                                           : snprintf(buf, sizeof buf, "%.*s: %.2f", llen(label), label, *v);
     text_c(r, buf, imin(n, (int)sizeof buf - 1), tint_theme.accent_text);
     return res;
 }
@@ -429,17 +459,20 @@ int tint_tabs(const char **names, int n, int *sel) {
 /* list */
 int tint_list(const char **it, int n, int *sel, int rows) {
     int s = sc(), b = bw(), rh = fh() + pad(), res = 0, p = pad(); rows = imax(rows, 1);
-    TintRect r = next_px(rows * rh + 2 * b), in = { r.x + b, r.y + b, r.w - 2 * b, r.h - 2 * b };
+    int fr = take_fill();
+    TintRect r = next_px(fr >= 0 ? fr : rows * rh + 2 * b), in = { r.x + b, r.y + b, r.w - 2 * b, r.h - 2 * b };
+    rows = imax(in.h / rh, 1);                         /* page size equals the argument unless tint_fill_rest / tint_h changed the height */
     uint32_t id = hptr(sel); int *v = tint_state(id); focusable(id);
     int content = n * rh, view = in.h, mx = imax(content - view, 0);
     if (hovered(r) && tint_in.wheel) { v[0] -= tint_in.wheel * 3 * rh; tint_in.wheel = 0; }
     if (focus == id && n > 0)
-        for (int k = 0; k < tint_in.nkeys; k++) {
+        for (int k = 0; k < nkeys(); k++) {
             int key = tint_in.keys[k].key, d = key == K_UP ? -1 : key == K_DOWN ? 1 : key == K_PGUP ? -rows :
                       key == K_PGDN ? rows : key == K_HOME ? -n : key == K_END ? n : 0;
+            if (key == K_RETURN && tint_list_activate && *sel >= 0 && *sel < n) res |= TINT_SUBMIT;
             if (!d) continue;
             int ns = iclamp(*sel < 0 && d > 0 ? d - 1 : *sel + d, 0, n - 1);
-            if (ns != *sel) { *sel = ns; res = 1; }
+            if (ns != *sel) { *sel = ns; res |= TINT_CHANGED; }
             if (ns * rh < v[0]) v[0] = ns * rh;
             if ((ns + 1) * rh > v[0] + view) v[0] = (ns + 1) * rh - view;
         }
@@ -451,9 +484,12 @@ int tint_list(const char **it, int n, int *sel, int rows) {
     for (int i = v[0] / rh; i < n && i * rh - v[0] < view; i++) {
         TintRect ir = { in.x, in.y + i * rh - v[0], in.w - sb, rh };
         unsigned f = tint_interact(id + (uint32_t)(i + 1) * 0x9E3779B1u, ir);
-        if (f & TINT_PRESS) { focus = id; claimed = 1; if (*sel != i) { *sel = i; res = 1; } }
+        if (f & TINT_PRESS) {
+            focus = id; claimed = 1; if (*sel != i) { *sel = i; res |= TINT_CHANGED; }
+            if (tint_list_activate && tint_in.clicks == 2) res |= TINT_SUBMIT;
+        }
         if (i == *sel) tint_fill(ir, tint_theme.accent); else if (f & TINT_HOVER) tint_fill(ir, tint_theme.hot);
-        tint_text(ir.x + p, ir.y + (rh - fh()) / 2, it[i], i == *sel ? tint_theme.accent_text : tint_theme.text);
+        text_fit(ir.x + p, ir.y + (rh - fh()) / 2, ir.w - 2 * p, it[i], (int)strlen(it[i]), i == *sel ? tint_theme.accent_text : tint_theme.text);
     }
     tint_pop_clip();
     tint_outline(r, focus == id ? tint_theme.accent : tint_theme.border);
@@ -484,6 +520,7 @@ static int ed_ins(char *b, int cap, int len, int at, const char *t, int n) {
 
 int tint_input(char *buf, size_t capz) {
     int s = sc(), b = bw(), p = pad(), cw = fw(), cap = (int)capz, res = 0;
+    const char *hint = tint_hint; tint_hint = NULL;
     TintRect r = next_px(rowh());
     if (cap < 1) return 0;
     uint32_t id = hptr(buf); int *v = tint_state(id); focusable(id);
@@ -502,7 +539,7 @@ int tint_input(char *buf, size_t capz) {
         } else if (tint_in.clicks == 1) cur = at;
     }
     if (focus == id)
-        for (int k = 0; k < tint_in.nkeys; k++) {
+        for (int k = 0; k < nkeys(); k++) {
             XEv *e = &tint_in.keys[k]; int ctrl = e->mod & M_CTRL, sh = e->mod & M_SHIFT;
             int lo = imin(cur, anc), hi = imax(cur, anc);
             switch (e->key) {
@@ -563,6 +600,7 @@ int tint_input(char *buf, size_t capz) {
         tint_fill((TintRect){ tx.x + a, tx.y - s, z - a, fh() + 2 * s }, tint_theme.accent);
     }
     tint_text(tx.x, tx.y, buf, tint_theme.text);
+    if (hint && !len && focus != id) text_fit(r.x + p, tx.y, iw, hint, (int)strlen(hint), tint_theme.dim);
     if (focus == id) tint_fill((TintRect){ tx.x + cx, tx.y - s, s, fh() + 2 * s }, tint_theme.text);
     tint_pop_clip();
     tint_outline(r, focus == id ? tint_theme.accent : (f & TINT_HOVER) ? tint_theme.dim : tint_theme.border);
