@@ -63,6 +63,7 @@ What you build with is small and fully public:
 | keep state | your own variables (immediate mode), or `tint_state(id)` for 3 ints that persist between frames |
 | tell widgets apart | `tint_id`, `tint_push_id` / `tint_pop_id` |
 | match the look | `tint_theme` colours, `tint_px()` scaling, `tint_text_h()` / `tint_text_w()` metrics |
+| know if a key is held | `tint_key_down(keysym)` / `tint_key_released(keysym)` set `x_keyup = 1` before `tint_open()` or they stay 0 |
 
 The Custom tab of `demo.c` builds a draggable splitter, two independent layout panes and a
 freehand canvas this way, in about 30 lines, without touching library internals. The same pattern
