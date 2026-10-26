@@ -466,7 +466,7 @@ static int key_ev(const uint8_t *e, XEv *out) {      /* decode a Key event; 0 if
     if (ks >= 0xffe1 && ks <= 0xffee) return 0; /* bare modifier */
     if (!ks) return 0;
     XEv ev; memset(&ev, 0, sizeof ev);
-    ev.type = X_KEY; ev.mod = mods_of(st); ev.synthetic = (e[0] & 0x80) != 0;
+    ev.type = X_KEY; ev.code = code; ev.mod = mods_of(st); ev.synthetic = (e[0] & 0x80) != 0;
     if ((ev.mod & M_CTRL) && ks >= 'A' && ks <= 'Z') ks += 32;
     ev.key = (int)ks;
     if (!(ev.mod & (M_CTRL | M_ALT))) {
