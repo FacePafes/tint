@@ -18,7 +18,20 @@ int tint_fill_rest, tint_square, tint_focus_next, tint_h;
 const char *tint_hint;
 
 #define BIG 3600000
-static int again, closing, claimed, tab, want_cursor, grab;
+static int again, closing, claimed, tab, want_cursor, grab, fn_retry;
+static struct { int code, key; } held[16]; static int nheld;      /* keys currently down (only with x_keyup) */
+static int rel_keys[16], nrel;                                    /* keys released this frame */
+static int keyfold(int k) { return k >= 'A' && k <= 'Z' ? k + 32 : k; }
+int tint_key_down(int keysym) {
+    if (tint_block) return 0;
+    for (int i = 0; i < nheld; i++) if (keyfold(held[i].key) == keyfold(keysym)) return 1;
+    return 0;
+}
+int tint_key_released(int keysym) {
+    if (tint_block) return 0;
+    for (int i = 0; i < nrel; i++) if (keyfold(rel_keys[i]) == keyfold(keysym)) return 1;
+    return 0;
+}
 static uint32_t active, focus, focus0, first_focus, salt[8]; static int nsalt;
 static unsigned frame_no;
 static int over_clip, over_lay, over_salt, over_scroll, sn;   /* sn: open scroll regions */
@@ -225,9 +238,10 @@ static TintRect next_px(int h) {
 }
 static int take_fill(void) {                        /* tint_fill_rest: height from the next cell's top to the clip bottom, else -1 */
     if (!tint_fill_rest) return -1;
+    int below = tint_h > 0 ? tint_h * sc() + pad() : 0;   /* both set: tint_h is what goes below, not the height of this one */
     tint_fill_rest = 0; tint_h = 0;
     Lay *l = &LY; int top = l->i ? l->ry : l->cy;
-    return imax(CLIP.y + CLIP.h - top, 0);
+    return imax(CLIP.y + CLIP.h - top - below, 0);
 }
 void tint_row(int n, const int *w) { endrow(&LY); setrow(&LY, n, w); }
 void tint_space(int px) { endrow(&LY); LY.cy += px * sc(); }
@@ -280,7 +294,7 @@ int tint_open(int w, int h, const char *title) {
 void tint_close(void) { free(x_fb); x_fb = NULL; x_close(); }
 
 int tint_begin(void) {
-    tint_in.pressed = tint_in.released = tint_in.rclick = tint_in.wheel = tint_in.nkeys = 0;
+    tint_in.pressed = tint_in.released = tint_in.rclick = tint_in.wheel = tint_in.nkeys = 0; nrel = 0;
     int wait = again ? 0 : tint_timeout < 0 ? BIG : tint_timeout, first = 1; XEv e;
     again = 0;
     for (;;) {
@@ -305,8 +319,18 @@ int tint_begin(void) {
             if (e.button == 1) { tint_in.down = 0; tint_in.released = 1; }
             break;
         case X_FOCUS_IN: tint_in.focused = 1; break;
-        case X_FOCUS_OUT: tint_in.focused = 0; break;
+        case X_FOCUS_OUT: tint_in.focused = 0; nheld = 0; break;     /* releases while unfocused never arrive */
+        case X_KEY_UP:
+            for (int i = 0; i < nheld; i++) if (held[i].code == e.code) {
+                if (nrel < 16) rel_keys[nrel++] = held[i].key;
+                held[i] = held[--nheld]; break;
+            }
+            break;
         case X_KEY:
+            if (x_keyup) {                                              /* repeats arrive as X_KEY again: don't add twice */
+                int i = 0; while (i < nheld && held[i].code != e.code) i++;
+                if (i < nheld) held[i].key = e.key; else if (nheld < 16) { held[nheld].code = e.code; held[nheld++].key = e.key; }
+            }
             if (e.key == K_TAB && !(e.mod & (M_CTRL | M_ALT))) tab = 1;
             else if (tint_in.nkeys < 32) tint_in.keys[tint_in.nkeys++] = e;
             break;
@@ -327,6 +351,8 @@ void tint_end(void) {
     tab = 0;
     if (!tint_in.down) active = 0;
     if (focus != focus0) again = 1;                 /* earlier widgets were drawn with the old focus */
+    if (tint_focus_next) { if (!fn_retry) again = 1; fn_retry = 1; }   /* set after the target was drawn: take it next frame, once (no target = no busy loop) */
+    else fn_retry = 0;
     x_cursor(want_cursor);
     x_present();
 }
