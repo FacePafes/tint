@@ -43,13 +43,13 @@ typedef struct {                      /* 0x00RRGGBB; edit before tint_open() or 
 } TintTheme;
 extern TintTheme tint_theme;
 
-typedef struct {                      /* this frame's input; read only for you */
-    int mx, my;                       /* pointer, physical px (far off-screen when outside the window) */
-    int down, pressed, released;      /* left button: held / went down this frame / went up this frame */
-    int rclick;                       /* right button went down this frame */
-    int clicks;                       /* 1, 2, 3... consecutive quick clicks of the last press */
+typedef struct {                      /* this frame's input, read only for you */
+    int mx, my;                       /* pointer, physical px (far off-screen until the pointer is seen and when outside the window) */
+    unsigned mod;                     /* M_CTRL / M_SHIFT / M_ALT held, as of the latest pointer or key event. A lone modifier press shows with the next event */
+    unsigned down, pressed, released; /* B_LEFT / B_MID / B_RIGHT bits: held / went down this frame / went up this frame */
+    int clicks;                       /* 1, 2, 3... consecutive quick left clicks of the last left press */
     int wheel;                        /* +up / -down notches not yet consumed by a widget */
-    XEv keys[32]; int nkeys;          /* X_KEY events this frame (Tab is consumed by the library) */
+    XEv keys[32]; int nkeys;          /* X_KEY events this frame. With a focus, nkeys is 0 for everyone but the owner (see tint_focusable) */
     int focused;                      /* window has keyboard focus 1 at open, kept current only when x_focus = 1 */
 } TintIn;
 extern TintIn tint_in;
@@ -60,12 +60,13 @@ extern TintIn tint_in;
 int tint_key_down(int keysym);         /* 1 while the key is held */
 int tint_key_released(int keysym);     /* 1 for the one frame in which it was released */
 
-extern int tint_timeout;               /* ms: -1 (default) sleeps until input; >=0 also produces a frame after that long (animation) */
+extern int tint_timeout;               /* ms: -1 (default) sleeps until input, >=0 also produces a frame after that long (animation). Stays set */
+void tint_wake(int ms);                /* ask for a frame within ms, this frame only. Requests and tint_timeout combine, the shortest wins */
 extern int tint_zoom;                  /* integer UI zoom on top of x_scale; set before tint_open() */
 extern int tint_raw_labels;            /* 1: no "##" parsing anywhere the id hashes the whole string */
 extern int tint_settle;                /* 1: any click/release/key this frame schedules one more frame */
 extern int tint_list_activate;         /* 1: tint_list also returns TINT_SUBMIT on double-click or Enter (TINT_CHANGED still means selection changed) */
-extern int tint_block;                 /* 1: widgets see no hover/click/wheel/keys/Tab (draw still works) e.g. the UI behind a modal */
+extern int tint_block;                 /* 1: widgets see no hover/click/wheel/keys/Tab (draw still works) e.g. the UI behind a modal. For popups tint_layer is usually enough */
 extern int tint_slider_int;            /* 1: sliders print "%d" and snap to integers */
 extern int tint_ellipsis;              /* 1: clipped label/radio/check/list text ends in "..." instead of a hard cut */
 extern int tint_fill_rest;             /* 1: next tint_list / tint_scroll_begin ignores rows/height and fills the space tint_avail would report.
@@ -75,6 +76,11 @@ extern int tint_square;                /* 1: next cell is h x h */
 extern int tint_focus_next;            /* 1: next focusable widget (input/list) takes keyboard focus. Set after that widget was already drawn this
                                           frame and the library runs one more frame by itself, so it still lands without tint_settle */
 extern int tint_h;                     /* logical px; 0 = unchanged. Overrides the height of the next cell/widget */
+extern int tint_focusable;             /* 1: the next tint_interact makes its id keyboard-focusable. Cleared by that call */
+extern int tint_layer;                 /* interaction priority for tint_interact and tint_hovered, 0 at every tint_begin, stays set until you change it */
+typedef uint32_t (*TintBlend)(uint32_t dst, uint32_t src);   /* returns the new 0x00RRGGBB pixel */
+extern TintBlend tint_blend;           /* NULL = plain copy. One-shot: applies to your next tint_fill / outline / line / circle / blit, then clears.
+                                          Library widgets and text never take it. Each pixel is blended once, also in lines */
 extern const char *tint_hint;          /* NULL = none. Next tint_input shows this dim while empty and unfocused */
 
 /* frame */
@@ -120,6 +126,9 @@ TintRect  tint_cell(int height);                    /* reserve the next layout c
 TintRect  tint_avail(void);                         /* the free area below the layout cursor (ends the current row) */
 void     tint_region_begin(TintRect r);            /* widgets inside flow in their own layout, clipped to r (physical px). */
 void     tint_region_end(void);                    /* Split panes, sidebars, cards, columns, overlays: regions nest (6 deep). */
+int      tint_hovered(TintRect r);                 /* pointer inside r and its clip, no id. Follows tint_block and tint_layer */
+int      tint_vscroll(uint32_t id, TintRect track, int content, int *off);   /* scrollbar: draws track + thumb, drags *off (px, 0..content-track.h). 1 if changed */
+int      tint_hscroll(uint32_t id, TintRect track, int content, int *off);   /* same along x, content and *off in px */
 void     tint_cursor(int x_cur_glyph);             /* pointer shape for this frame: X_CUR_HAND, X_CUR_HSIZE, ... */
 int     *tint_state(uint32_t id);                  /* 3 ints of state that persist between frames, zeroed on first use */
 unsigned tint_interact(uint32_t id, TintRect r);    /* hover/press/click logic; id from tint_id() */
