@@ -7,6 +7,7 @@
 enum { X_NONE, X_KEY, X_BTN_DOWN, X_BTN_UP, X_MOTION, X_WHEEL, X_RESIZE, X_EXPOSE, X_CLOSE, X_LEAVE,
        X_KEY_UP, X_FOCUS_IN, X_FOCUS_OUT };   
 enum { M_CTRL = 1, M_SHIFT = 2, M_ALT = 4 };
+enum { B_LEFT = 1, B_MID = 2, B_RIGHT = 4 };      /* mouse buttons as bits, button n is 1 << (n - 1) */
 
 /* X keysyms for the keys I care about printable keys use their ASCII value. */
 enum { K_BACKSPACE = 0xff08, K_TAB = 0xff09, K_RETURN = 0xff0d, K_ESCAPE = 0xff1b,
