@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #include "tint.h"
 #include <ctype.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,10 +12,12 @@
 TintTheme tint_theme = { .bg = 0x1e1f22, .panel = 0x2d2f34, .field = 0x17181b, .border = 0x474a52,
                        .text = 0xe4e6ea, .dim = 0x8b8f98, .accent = 0x3d7eff, .accent_text = 0xffffff,
                        .hot = 0x3a3d44, .active = 0x4a4e57 };
-TintIn tint_in;
+TintIn tint_in = { .mx = -100000, .my = -100000 };   /* off-screen until the first pointer event */
 int tint_timeout = -1, tint_zoom = 1;
 int tint_raw_labels, tint_settle, tint_list_activate, tint_block, tint_slider_int, tint_ellipsis;
 int tint_fill_rest, tint_square, tint_focus_next, tint_h;
+int tint_focusable, tint_layer;
+TintBlend tint_blend;
 const char *tint_hint;
 
 #define BIG 3600000
@@ -34,6 +37,9 @@ int tint_key_released(int keysym) {
 }
 static uint32_t active, focus, focus0, first_focus, salt[8]; static int nsalt;
 static unsigned frame_no;
+static int focus_raw, first_raw, focus_seen, nkb, wake = -1;     /* focus_raw: the focus came from tint_focusable. nkb: real key count */
+static int top_prev = INT_MIN, top_now = INT_MIN;                /* highest layer under the pointer, last frame and this frame */
+static void show_keys(int mine) { tint_in.nkeys = (tint_block || (focus && !mine)) ? 0 : nkb; }   /* with a focus, only its owner sees keys */
 static int over_clip, over_lay, over_salt, over_scroll, sn;   /* sn: open scroll regions */
 
 static int sc(void)  { return x_scale * tint_zoom; }
@@ -91,39 +97,78 @@ static TintRect visible(TintRect r) { TintRect fb = { 0, 0, x_w, x_h }; return i
 void tint_push_clip(TintRect r) { if (cn < 15) { cs[cn + 1] = isect(cs[cn], r); cn++; } else over_clip++; }
 void tint_pop_clip(void) { if (over_clip) over_clip--; else if (cn > 0) cn--; }
 static int inside(TintRect r, int x, int y) { return x >= r.x && y >= r.y && x < r.x + r.w && y < r.y + r.h; }
-static int hovered(TintRect r) { return !tint_block && inside(r, tint_in.mx, tint_in.my) && inside(CLIP, tint_in.mx, tint_in.my); }
+static int under(TintRect r) { return inside(r, tint_in.mx, tint_in.my) && inside(CLIP, tint_in.mx, tint_in.my); }
+int tint_hovered(TintRect r) { return !tint_block && under(r) && tint_layer >= top_prev; }
 
-void tint_fill(TintRect r, uint32_t c) {
+static TintBlend take_blend(void) { TintBlend f = tint_blend; tint_blend = NULL; return f; }
+static void fill_(TintRect r, uint32_t c, TintBlend f) {
     r = visible(r);
-    for (int y = r.y; y < r.y + r.h; y++) { uint32_t *p = x_fb + (size_t)y * x_w + r.x; for (int i = 0; i < r.w; i++) p[i] = c; }
-}
-void tint_outline(TintRect r, uint32_t c) {
-    int b = bw();
-    tint_fill((TintRect){ r.x, r.y, r.w, b }, c);               tint_fill((TintRect){ r.x, r.y + r.h - b, r.w, b }, c);
-    tint_fill((TintRect){ r.x, r.y + b, b, r.h - 2 * b }, c);    tint_fill((TintRect){ r.x + r.w - b, r.y + b, b, r.h - 2 * b }, c);
-}
-void tint_line(int x0, int y0, int x1, int y1, uint32_t c) {   /* Bresenham each point is a tint_px(1) square */
-    long dx = labs((long)x1 - x0), dy = -labs((long)y1 - y0), err = dx + dy;   /* long: no int overflow on extreme coords */
-    int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1, t = bw();
-    for (;;) {
-        tint_fill((TintRect){ x0, y0, t, t }, c);
-        if (x0 == x1 && y0 == y1) break;
-        long e2 = 2 * err;
-        if (e2 >= dy) { err += dy; x0 += sx; }
-        if (e2 <= dx) { err += dx; y0 += sy; }
+    for (int y = r.y; y < r.y + r.h; y++) {
+        uint32_t *p = x_fb + (size_t)y * x_w + r.x;
+        if (f) for (int i = 0; i < r.w; i++) p[i] = f(p[i], c);
+        else for (int i = 0; i < r.w; i++) p[i] = c;
     }
 }
-void tint_circle(int cx, int cy, int r, uint32_t c) {
+static void outline_(TintRect r, uint32_t c, TintBlend f) {      /* four disjoint strips, so a blend hits each pixel once */
+    int b = bw();
+    fill_((TintRect){ r.x, r.y, r.w, b }, c, f);               fill_((TintRect){ r.x, r.y + r.h - b, r.w, b }, c, f);
+    fill_((TintRect){ r.x, r.y + b, b, r.h - 2 * b }, c, f);    fill_((TintRect){ r.x + r.w - b, r.y + b, b, r.h - 2 * b }, c, f);
+}
+static void circle_(int cx, int cy, int r, uint32_t c, TintBlend f) {
     for (int dy = -r; dy <= r; dy++) {
         int dx = 0; while ((dx + 1) * (dx + 1) + dy * dy <= r * r) dx++;
-        tint_fill((TintRect){ cx - dx, cy + dy, 2 * dx + 1, 1 }, c);
+        fill_((TintRect){ cx - dx, cy + dy, 2 * dx + 1, 1 }, c, f);
     }
 }
-void tint_blit(int x, int y, int w, int h, const uint32_t *px) {
+static void blit_(int x, int y, int w, int h, const uint32_t *px, TintBlend f) {
     TintRect v = visible((TintRect){ x, y, w, h });
-    for (int j = v.y; j < v.y + v.h; j++)
-        memcpy(x_fb + (size_t)j * x_w + v.x, px + (size_t)(j - y) * w + (v.x - x), (size_t)v.w * 4);
+    for (int j = v.y; j < v.y + v.h; j++) {
+        const uint32_t *s = px + (size_t)(j - y) * w + (v.x - x); uint32_t *d = x_fb + (size_t)j * x_w + v.x;
+        if (f) for (int i = 0; i < v.w; i++) d[i] = f(d[i], s[i]);
+        else memcpy(d, s, (size_t)v.w * 4);
+    }
 }
+/* One point per step along the major axis, each a tint_px(1) square. Every point is computed from its step number alone,
+ * so the pixels never depend on where the clip is. The step range is cut to the clip first, cost follows the visible part.
+ * With a blend the steps are at least a square apart, so no pixel is blended twice. */
+static void line_(int x0, int y0, int x1, int y1, uint32_t c, TintBlend f) {
+    long dx = (long)x1 - x0, dy = (long)y1 - y0, ax = labs(dx), ay = labs(dy), m = ax > ay ? ax : ay;
+    int t = bw(), sx = dx < 0 ? -1 : 1, sy = dy < 0 ? -1 : 1, xm = ax >= ay;
+    TintRect v = isect(CLIP, (TintRect){ 0, 0, x_w, x_h });
+    if (!v.w || !v.h) return;
+    double u0 = 0, u1 = 1, p0[2] = { x0, y0 }, d[2] = { (double)dx, (double)dy };
+    double lo[2] = { v.x - t, v.y - t }, hi[2] = { v.x + v.w, v.y + v.h };
+    for (int a = 0; a < 2; a++) {                                  /* Liang-Barsky on the clip grown by one square */
+        if (d[a] == 0) { if (p0[a] < lo[a] || p0[a] > hi[a]) return; continue; }
+        double ta = (lo[a] - p0[a]) / d[a], tb = (hi[a] - p0[a]) / d[a];
+        if (ta > tb) { double s = ta; ta = tb; tb = s; }
+        if (ta > u0) u0 = ta;
+        if (tb < u1) u1 = tb;
+    }
+    if (u0 > u1) return;
+    long n = f ? m / t : m;
+    if (n == 0) { fill_((TintRect){ x0, y0, t, t }, c, f); return; }
+    long kmin = (long)(u0 * (double)m) - 2, kmax = (long)(u1 * (double)m) + 3;   /* margin for rounding */
+    if (kmin < 0) kmin = 0;
+    if (kmax > m) kmax = m;
+    long i0 = n == m ? kmin : (long)((double)kmin * (double)n / (double)m) - 1, i1 = n == m ? kmax : (long)((double)kmax * (double)n / (double)m) + 1;
+    if (i0 < 0) i0 = 0;
+    if (i1 > n) i1 = n;
+    for (long i = i0; i <= i1; i++) {
+        long k = n == m ? i : (long)((double)i * (double)m / (double)n);
+        long o = (long)((double)(xm ? ay : ax) * (double)k / (double)m + 0.5);   /* minor axis, rounded */
+        fill_((TintRect){ (int)(x0 + (xm ? k : o) * sx), (int)(y0 + (xm ? o : k) * sy), t, t }, c, f);
+    }
+}
+void tint_fill(TintRect r, uint32_t c) { fill_(r, c, take_blend()); }
+void tint_outline(TintRect r, uint32_t c) { outline_(r, c, take_blend()); }
+void tint_line(int x0, int y0, int x1, int y1, uint32_t c) { line_(x0, y0, x1, y1, c, take_blend()); }
+void tint_circle(int cx, int cy, int r, uint32_t c) { circle_(cx, cy, r, c, take_blend()); }
+void tint_blit(int x, int y, int w, int h, const uint32_t *px) { blit_(x, y, w, h, px, take_blend()); }
+/* the library's own drawing never takes tint_blend, so a pending one reaches your next primitive */
+static void fill0(TintRect r, uint32_t c) { fill_(r, c, NULL); }
+static void outline0(TintRect r, uint32_t c) { outline_(r, c, NULL); }
+static void circle0(int cx, int cy, int r, uint32_t c) { circle_(cx, cy, r, c, NULL); }
 
 /* UTF-8 */
 static int u8_next(const char *s, int i) { if (!s[i]) return i; i++; while ((s[i] & 0xC0) == 0x80) i++; return i; }
@@ -166,8 +211,8 @@ static void glyph(int x, int y, uint32_t cp, uint32_t c) {
     if (!g) {                                                                    /* missing glyph: outlined box */
         int bw_ = (W - 2) * s, bh = (F->h - 2) * s;
         if (bw_ > 2 * s && bh > 2 * s) {
-            tint_fill((TintRect){ x + s, y + s, bw_, s }, c);              tint_fill((TintRect){ x + s, y + s + bh - s, bw_, s }, c);
-            tint_fill((TintRect){ x + s, y + 2 * s, s, bh - 2 * s }, c);   tint_fill((TintRect){ x + s + bw_ - s, y + 2 * s, s, bh - 2 * s }, c);
+            fill0((TintRect){ x + s, y + s, bw_, s }, c);              fill0((TintRect){ x + s, y + s + bh - s, bw_, s }, c);
+            fill0((TintRect){ x + s, y + 2 * s, s, bh - 2 * s }, c);   fill0((TintRect){ x + s + bw_ - s, y + 2 * s, s, bh - 2 * s }, c);
         }
         return;
     }
@@ -177,7 +222,7 @@ static void glyph(int x, int y, uint32_t cp, uint32_t c) {
         for (int b = 0; b < W; b++) {
             if (!(row[b >> 3] >> (b & 7) & 1)) continue;
             int e = b; while (e < W && (row[e >> 3] >> (e & 7) & 1)) e++;        /* merge a horizontal run */
-            tint_fill((TintRect){ x + b * s, y + r * s, (e - b) * s, s }, c); b = e;
+            fill0((TintRect){ x + b * s, y + r * s, (e - b) * s, s }, c); b = e;
         }
     }
 }
@@ -226,6 +271,7 @@ static void setrow(Lay *l, int n, const int *w) {
 static void endrow(Lay *l) { if (l->i > 0) { l->cy = l->ry + l->rh + pad(); l->i = 0; } l->n = 0; }
 static TintRect next_px(int h) {
     Lay *l = &LY;
+    show_keys(0);                                   /* a new cell ends the focused widget's view of keys */
     if (tint_h > 0) h = tint_h * sc();
     tint_h = 0;
     if (l->n == 0) setrow(l, 1, NULL);
@@ -265,23 +311,35 @@ void tint_region_end(void) {
 }
 
 /* interaction */
-unsigned tint_interact(uint32_t id, TintRect r) {
-    if (tint_block) return 0;
-    int in = hovered(r); unsigned f = 0;
-    if (in && (!active || active == id)) f |= TINT_HOVER;
-    if (in && tint_in.pressed && !active) { active = id; f |= TINT_PRESS; }
-    if (active == id && tint_in.down) f |= TINT_HELD;
-    if (active == id && tint_in.released) { if (in) f |= TINT_CLICK; active = 0; }
+static void take_focus(uint32_t id, int raw) { focus = id; focus_raw = raw; focus_seen = 1; claimed = 1; }
+static unsigned hit(uint32_t id, TintRect r) {
+    int in = under(r), vis;
+    if (in && tint_layer > top_now) top_now = tint_layer;
+    vis = in && (tint_layer >= top_prev || active == id);          /* a higher layer under the pointer hides this one */
+    unsigned f = 0;
+    if (vis && (!active || active == id)) f |= TINT_HOVER;
+    if (vis && (tint_in.pressed & B_LEFT) && !active) { active = id; f |= TINT_PRESS; }
+    if (active == id && (tint_in.down & B_LEFT)) f |= TINT_HELD;
+    if (active == id && (tint_in.released & B_LEFT)) { if (in) f |= TINT_CLICK; active = 0; }
     return f;
 }
-/* Tab cycles keyboard focus through focusable widgets (inputs, lists). */
-static int nkeys(void) { return tint_block ? 0 : tint_in.nkeys; }
-static void focusable(uint32_t id) {
-    if (tint_block) return;
-    if (tint_focus_next) { focus = id; claimed = 1; tint_focus_next = 0; }
-    if (!first_focus) first_focus = id;
-    if (tab == 2 || (tab == 1 && !focus)) { focus = id; tab = 0; }
+/* Tab cycles keyboard focus through focusable widgets (inputs, lists, tint_focusable ids). */
+static int nkeys(void) { return tint_block ? 0 : nkb; }
+static void focusable(uint32_t id, int raw) {
+    if (tint_block) { if (id == focus) focus_seen = 1; return; }
+    if (tint_focus_next) { take_focus(id, raw); tint_focus_next = 0; }
+    if (!first_focus) { first_focus = id; first_raw = raw; }
+    if (tab == 2 || (tab == 1 && !focus)) { focus = id; focus_raw = raw; tab = 0; }
     else if (tab == 1 && focus == id) tab = 2;
+    if (id == focus) focus_seen = 1;
+}
+unsigned tint_interact(uint32_t id, TintRect r) {
+    int fc = tint_focusable; tint_focusable = 0;
+    if (fc) focusable(id, 1);
+    unsigned f = tint_block ? 0 : hit(id, r);
+    if (fc && (f & TINT_PRESS)) take_focus(id, 1);
+    show_keys(fc && focus == id);
+    return f;
 }
 
 /* frame */
@@ -292,89 +350,109 @@ int tint_open(int w, int h, const char *title) {
     again = 1; tint_in.focused = 1; return 0;
 }
 void tint_close(void) { free(x_fb); x_fb = NULL; x_close(); }
+void tint_wake(int ms) { if (ms >= 0 && (wake < 0 || ms < wake)) wake = ms; }
 
 int tint_begin(void) {
-    tint_in.pressed = tint_in.released = tint_in.rclick = tint_in.wheel = tint_in.nkeys = 0; nrel = 0;
-    int wait = again ? 0 : tint_timeout < 0 ? BIG : tint_timeout, first = 1; XEv e;
+    tint_in.pressed = tint_in.released = tint_in.wheel = 0; nkb = 0; nrel = 0;
+    int t = tint_timeout;
+    if (wake >= 0 && (t < 0 || wake < t)) t = wake;        /* the shortest request wins */
+    wake = -1;
+    int wait = again ? 0 : t < 0 ? BIG : t, first = 1; XEv e;
     again = 0;
     for (;;) {
         if (!x_wait(&e, first ? wait : 0)) { if (first && wait == BIG) continue; break; }
         first = 0;
         switch (e.type) {
         case X_CLOSE: closing = 1; break;
-        case X_MOTION: tint_in.mx = e.x; tint_in.my = e.y; break;
+        case X_MOTION: tint_in.mx = e.x; tint_in.my = e.y; tint_in.mod = e.mod; break;
         case X_LEAVE: if (!tint_in.down) tint_in.mx = tint_in.my = -100000; break;
-        case X_WHEEL: tint_in.mx = e.x; tint_in.my = e.y; tint_in.wheel += e.dy; break;
+        case X_WHEEL: tint_in.mx = e.x; tint_in.my = e.y; tint_in.mod = e.mod; tint_in.wheel += e.dy; break;
         case X_BTN_DOWN:
-            tint_in.mx = e.x; tint_in.my = e.y;
-            if (e.button == 3) tint_in.rclick = 1;
-            if (e.button == 1) {
-                static long t0; static int x0, y0; long t = tint_now_ms();
-                tint_in.clicks = (t - t0 < 400 && abs(e.x - x0) < tint_px(4) && abs(e.y - y0) < tint_px(4)) ? tint_in.clicks + 1 : 1;
-                t0 = t; x0 = e.x; y0 = e.y; tint_in.down = tint_in.pressed = 1;
+            tint_in.mx = e.x; tint_in.my = e.y; tint_in.mod = e.mod;
+            if (e.button >= 1 && e.button <= 3) {
+                unsigned b = 1u << (e.button - 1);
+                tint_in.down |= b; tint_in.pressed |= b;
+                if (b == B_LEFT) {
+                    static long t0; static int x0, y0; long now = tint_now_ms();
+                    tint_in.clicks = (now - t0 < 400 && abs(e.x - x0) < tint_px(4) && abs(e.y - y0) < tint_px(4)) ? tint_in.clicks + 1 : 1;
+                    t0 = now; x0 = e.x; y0 = e.y;
+                }
             }
             break;
         case X_BTN_UP:
-            tint_in.mx = e.x; tint_in.my = e.y;
-            if (e.button == 1) { tint_in.down = 0; tint_in.released = 1; }
+            tint_in.mx = e.x; tint_in.my = e.y; tint_in.mod = e.mod;
+            if (e.button >= 1 && e.button <= 3) { unsigned b = 1u << (e.button - 1); tint_in.down &= ~b; tint_in.released |= b; }
             break;
         case X_FOCUS_IN: tint_in.focused = 1; break;
-        case X_FOCUS_OUT: tint_in.focused = 0; nheld = 0; break;     /* releases while unfocused never arrive */
+        case X_FOCUS_OUT: tint_in.focused = 0; tint_in.mod = 0; nheld = 0; break;     /* releases while unfocused never arrive */
         case X_KEY_UP:
+            tint_in.mod = e.mod;
             for (int i = 0; i < nheld; i++) if (held[i].code == e.code) {
                 if (nrel < 16) rel_keys[nrel++] = held[i].key;
                 held[i] = held[--nheld]; break;
             }
             break;
         case X_KEY:
+            tint_in.mod = e.mod;
             if (x_keyup) {                                              /* repeats arrive as X_KEY again: don't add twice */
                 int i = 0; while (i < nheld && held[i].code != e.code) i++;
                 if (i < nheld) held[i].key = e.key; else if (nheld < 16) { held[nheld].code = e.code; held[nheld++].key = e.key; }
             }
-            if (e.key == K_TAB && !(e.mod & (M_CTRL | M_ALT))) tab = 1;
-            else if (tint_in.nkeys < 32) tint_in.keys[tint_in.nkeys++] = e;
+            if (e.key == K_TAB && !(e.mod & (M_CTRL | M_ALT)) && !(focus && focus_raw)) tab = 1;   /* a tint_focusable widget keeps its Tab */
+            else if (nkb < 32) tint_in.keys[nkb++] = e;
             break;
         default: break;     /* X_RESIZE / X_EXPOSE just mean "draw a frame" */
         }
     }
     if (closing) return 0;
+    tint_in.nkeys = focus ? 0 : nkb;
     cn = 0; cs[0] = (TintRect){ 0, 0, x_w, x_h };
-    tint_fill(cs[0], tint_theme.bg);
+    fill0(cs[0], tint_theme.bg);
     ln = 0; memset(&L[0], 0, sizeof L[0]); L[0].x = pad(); L[0].w = imax(x_w - 2 * pad(), 0); L[0].cy = pad();
-    nsalt = 0; over_clip = over_lay = over_salt = over_scroll = 0; sn = 0; claimed = 0; focus0 = focus; first_focus = 0; want_cursor = X_CUR_ARROW; frame_no++;
+    nsalt = 0; over_clip = over_lay = over_salt = over_scroll = 0; sn = 0; claimed = 0; focus0 = focus; first_focus = 0; first_raw = 0;
+    focus_seen = 0; top_now = INT_MIN; tint_layer = 0; tint_focusable = 0; tint_blend = NULL;
+    want_cursor = X_CUR_ARROW; frame_no++;
     return 1;
 }
 void tint_end(void) {
-    if (tint_settle && (tint_in.pressed || tint_in.released || tint_in.rclick || tint_in.nkeys || tab)) again = 1;
-    if (tint_in.pressed && !claimed) focus = 0;      /* click on nothing focusable: drop focus */
-    if (tab == 2) focus = first_focus;              /* Tab past the last widget wraps around */
+    if (tint_settle && (tint_in.pressed || tint_in.released || nkb || tab)) again = 1;
+    if ((tint_in.pressed & B_LEFT) && !claimed) focus = 0;      /* click on nothing focusable: drop focus */
+    if (tab == 2) { focus = first_focus; focus_raw = first_raw; }   /* Tab past the last widget wraps around */
+    else if (focus && !focus_seen) focus = 0;                   /* the focused widget was not drawn: nobody owns keys */
     tab = 0;
-    if (!tint_in.down) active = 0;
+    if (!(tint_in.down & B_LEFT)) active = 0;
     if (focus != focus0) again = 1;                 /* earlier widgets were drawn with the old focus */
+    if (top_now != top_prev) again = 1;             /* layers were resolved from the old pointer spot */
+    top_prev = top_now;
     if (tint_focus_next) { if (!fn_retry) again = 1; fn_retry = 1; }   /* set after the target was drawn: take it next frame, once (no target = no busy loop) */
     else fn_retry = 0;
     x_cursor(want_cursor);
     x_present();
 }
 
-/* scrollbar: draws the track + thumb, handles dragging returns 1 if *off changed */
-static int vscroll(uint32_t id, TintRect t, int content, int *off) {
-    int view = t.h, mx = content - view, th = view * view / imax(content, 1);
-    tint_fill(t, tint_theme.panel);
-    if (mx <= 0) { *off = 0; return 0; }
+/* scrollbar: draws the track + thumb, handles dragging. Returns 1 if *off changed. content and *off are in px along the bar */
+static int scrollbar(uint32_t id, TintRect t, int content, int *off, int horiz) {
+    int view = horiz ? t.w : t.h, rng = content - view, th = (int)((long)view * view / imax(content, 1));
+    int p0 = horiz ? t.x : t.y, ptr = horiz ? tint_in.mx : tint_in.my;
+    fill0(t, tint_theme.panel);
+    if (rng <= 0) { *off = 0; return 0; }
     th = imax(th, 12 * sc());
     if (view - th <= 0) return 0;
-    int ty = t.y + (int)((long)*off * (view - th) / mx), ch = 0;
+    int tp = p0 + (int)((long)*off * (view - th) / rng), ch = 0;
     unsigned f = tint_interact(id, t);
-    if (f & TINT_PRESS) grab = (tint_in.my >= ty && tint_in.my < ty + th) ? tint_in.my - ty : th / 2;
+    if (f & TINT_PRESS) grab = (ptr >= tp && ptr < tp + th) ? ptr - tp : th / 2;
     if (f & TINT_HELD) {
-        int n = iclamp((int)((long)(tint_in.my - grab - t.y) * mx / (view - th)), 0, mx);
+        int n = iclamp((int)((long)(ptr - grab - p0) * rng / (view - th)), 0, rng);
         if (n != *off) { *off = n; ch = 1; }
-        ty = t.y + (int)((long)*off * (view - th) / mx);
+        tp = p0 + (int)((long)*off * (view - th) / rng);
     }
-    tint_fill((TintRect){ t.x + bw(), ty, t.w - 2 * bw(), th }, (f & (TINT_HELD | TINT_HOVER)) ? tint_theme.dim : tint_theme.border);
+    uint32_t col = (f & (TINT_HELD | TINT_HOVER)) ? tint_theme.dim : tint_theme.border;
+    if (horiz) fill0((TintRect){ tp, t.y + bw(), th, t.h - 2 * bw() }, col);
+    else       fill0((TintRect){ t.x + bw(), tp, t.w - 2 * bw(), th }, col);
     return ch;
 }
+int tint_vscroll(uint32_t id, TintRect t, int content, int *off) { return scrollbar(id, t, content, off, 0); }
+int tint_hscroll(uint32_t id, TintRect t, int content, int *off) { return scrollbar(id, t, content, off, 1); }
 
 /* scroll region */
 static struct { TintRect r; uint32_t id; int off0; } SC[4];
@@ -385,7 +463,7 @@ void tint_scroll_begin(const char *label, int h) {
     if (sn >= 4 || ln >= 7) { over_scroll++; return; }   /* too deep: contents flow unscrolled in the parent */
     uint32_t id = tint_id(label); int *v = tint_state(id);
     v[0] = iclamp(v[0], 0, imax(v[1] - (r.h - 2 * b), 0));
-    tint_fill(r, tint_theme.field);
+    fill0(r, tint_theme.field);
     SC[sn].r = r; SC[sn].id = id; SC[sn].off0 = v[0]; sn++;
     tint_push_clip((TintRect){ r.x + b, r.y + b, r.w - 2 * b, r.h - 2 * b });
     ln++;
@@ -399,13 +477,13 @@ void tint_scroll_end(void) {
     int content = LY.cy - (r.y + b - SC[sn].off0), view = r.h - 2 * b, off = SC[sn].off0;
     v[1] = content;
     ln--; tint_pop_clip();
-    if (hovered(r) && tint_in.wheel) { off -= tint_in.wheel * 36 * sc(); tint_in.wheel = 0; }
+    if (tint_hovered(r) && tint_in.wheel) { off -= tint_in.wheel * 36 * sc(); tint_in.wheel = 0; }
     off = iclamp(off, 0, imax(content - view, 0));
-    vscroll(SC[sn].id ^ 0xA5A5A5A5u, (TintRect){ r.x + r.w - b - 8 * sc(), r.y + b, 8 * sc(), view }, content, &off);
+    tint_vscroll(SC[sn].id ^ 0xA5A5A5A5u, (TintRect){ r.x + r.w - b - 8 * sc(), r.y + b, 8 * sc(), view }, content, &off);
     off = iclamp(off, 0, imax(content - view, 0));
     v[0] = off;
     if (off != SC[sn].off0) again = 1;              /* content was laid out with the old offset */
-    tint_outline(r, tint_theme.border);
+    outline0(r, tint_theme.border);
 }
 
 /* simple widgets */
@@ -416,12 +494,12 @@ void tint_label(const char *s) {
 void tint_labelf(const char *fmt, ...) {
     char b[512]; va_list a; va_start(a, fmt); vsnprintf(b, sizeof b, fmt, a); va_end(a); tint_label(b);
 }
-void tint_sep(void) { TintRect r = next_px(pad()); tint_fill((TintRect){ r.x, r.y + r.h / 2, r.w, bw() }, tint_theme.border); }
+void tint_sep(void) { TintRect r = next_px(pad()); fill0((TintRect){ r.x, r.y + r.h / 2, r.w, bw() }, tint_theme.border); }
 
 int tint_button(const char *label) {
     TintRect r = next_px(rowh()); unsigned f = tint_interact(tint_id(label), r);
     uint32_t bg = (f & TINT_HELD) && (f & TINT_HOVER) ? tint_theme.active : (f & TINT_HOVER) ? tint_theme.hot : tint_theme.panel;
-    tint_fill(r, bg); tint_outline(r, tint_theme.border);
+    fill0(r, bg); outline0(r, tint_theme.border);
     text_c(r, label, llen(label), tint_theme.text);
     return !!(f & TINT_CLICK);
 }
@@ -429,8 +507,8 @@ int tint_check(const char *label, int *v) {
     int s = sc(), bs = fh() + 2 * s; TintRect r = next_px(rowh()); unsigned f = tint_interact(tint_id(label), r);
     if (f & TINT_CLICK) *v = !*v;
     TintRect bx = { r.x, r.y + (r.h - bs) / 2, bs, bs };
-    tint_fill(bx, tint_theme.field); tint_outline(bx, (f & TINT_HOVER) ? tint_theme.accent : tint_theme.border);
-    if (*v) tint_fill((TintRect){ bx.x + 3 * s, bx.y + 3 * s, bs - 6 * s, bs - 6 * s }, tint_theme.accent);
+    fill0(bx, tint_theme.field); outline0(bx, (f & TINT_HOVER) ? tint_theme.accent : tint_theme.border);
+    if (*v) fill0((TintRect){ bx.x + 3 * s, bx.y + 3 * s, bs - 6 * s, bs - 6 * s }, tint_theme.accent);
     tint_push_clip(r); text_fit(r.x + bs + pad(), r.y + (r.h - fh()) / 2, r.w - bs - pad(), label, llen(label), tint_theme.text); tint_pop_clip();
     return !!(f & TINT_CLICK);
 }
@@ -438,9 +516,9 @@ int tint_radio(const char *label, int *v, int val) {
     int s = sc(), rad = (fh() + 2 * s) / 2; TintRect r = next_px(rowh()); unsigned f = tint_interact(tint_id(label), r);
     int res = !!(f & TINT_CLICK); if (res) *v = val;
     int cx = r.x + rad, cy = r.y + r.h / 2;
-    tint_circle(cx, cy, rad, (f & TINT_HOVER) ? tint_theme.accent : tint_theme.border);
-    tint_circle(cx, cy, rad - s, tint_theme.field);
-    if (*v == val) tint_circle(cx, cy, rad - 3 * s, tint_theme.accent);
+    circle0(cx, cy, rad, (f & TINT_HOVER) ? tint_theme.accent : tint_theme.border);
+    circle0(cx, cy, rad - s, tint_theme.field);
+    if (*v == val) circle0(cx, cy, rad - 3 * s, tint_theme.accent);
     tint_push_clip(r); text_fit(r.x + 2 * rad + pad(), r.y + (r.h - fh()) / 2, r.w - 2 * rad - pad(), label, llen(label), tint_theme.text); tint_pop_clip();
     return res;
 }
@@ -454,9 +532,9 @@ int tint_slider(const char *label, float *v, float lo, float hi) {
         if (nv != *v) { *v = nv; res = 1; }
     }
     float t = hi > lo ? (*v - lo) / (hi - lo) : 0; t = t < 0 ? 0 : t > 1 ? 1 : t;
-    tint_fill(r, tint_theme.field);
-    tint_fill((TintRect){ r.x + b, r.y + b, (int)((r.w - 2 * b) * t), r.h - 2 * b }, tint_theme.accent);
-    tint_outline(r, (f & TINT_HOVER) ? tint_theme.dim : tint_theme.border);
+    fill0(r, tint_theme.field);
+    fill0((TintRect){ r.x + b, r.y + b, (int)((r.w - 2 * b) * t), r.h - 2 * b }, tint_theme.accent);
+    outline0(r, (f & TINT_HOVER) ? tint_theme.dim : tint_theme.border);
     char buf[128]; int n = tint_slider_int ? snprintf(buf, sizeof buf, "%.*s: %d", llen(label), label, (int)(*v + (*v < 0 ? -0.5f : 0.5f)))
                                            : snprintf(buf, sizeof buf, "%.*s: %.2f", llen(label), label, *v);
     text_c(r, buf, imin(n, (int)sizeof buf - 1), tint_theme.accent_text);
@@ -464,9 +542,9 @@ int tint_slider(const char *label, float *v, float lo, float hi) {
 }
 void tint_progress(float t) {
     int b = bw(); TintRect r = next_px(rowh()); t = t < 0 ? 0 : t > 1 ? 1 : t;
-    tint_fill(r, tint_theme.field);
-    tint_fill((TintRect){ r.x + b, r.y + b, (int)((r.w - 2 * b) * t), r.h - 2 * b }, tint_theme.accent);
-    tint_outline(r, tint_theme.border);
+    fill0(r, tint_theme.field);
+    fill0((TintRect){ r.x + b, r.y + b, (int)((r.w - 2 * b) * t), r.h - 2 * b }, tint_theme.accent);
+    outline0(r, tint_theme.border);
     char buf[16]; int n = snprintf(buf, sizeof buf, "%d%%", (int)(t * 100 + 0.5f)); text_c(r, buf, n, tint_theme.accent_text);
 }
 int tint_tabs(const char **names, int n, int *sel) {
@@ -475,8 +553,8 @@ int tint_tabs(const char **names, int n, int *sel) {
         TintRect t = { r.x + i * w, r.y, i == n - 1 ? r.w - i * w : w, r.h };
         unsigned f = tint_interact(tint_id(names[i]) ^ 0x7ab5c3d1u, t);
         if ((f & TINT_CLICK) && *sel != i) { *sel = i; res = 1; }
-        tint_fill(t, i == *sel ? tint_theme.accent : (f & TINT_HOVER) ? tint_theme.hot : tint_theme.panel);
-        tint_outline(t, tint_theme.border);
+        fill0(t, i == *sel ? tint_theme.accent : (f & TINT_HOVER) ? tint_theme.hot : tint_theme.panel);
+        outline0(t, tint_theme.border);
         text_c(t, names[i], llen(names[i]), i == *sel ? tint_theme.accent_text : tint_theme.text);
     }
     return res;
@@ -488,9 +566,9 @@ int tint_list(const char **it, int n, int *sel, int rows) {
     int fr = take_fill();
     TintRect r = next_px(fr >= 0 ? fr : rows * rh + 2 * b), in = { r.x + b, r.y + b, r.w - 2 * b, r.h - 2 * b };
     rows = imax(in.h / rh, 1);                         /* page size equals the argument unless tint_fill_rest / tint_h changed the height */
-    uint32_t id = hptr(sel); int *v = tint_state(id); focusable(id);
+    uint32_t id = hptr(sel); int *v = tint_state(id); focusable(id, 0);
     int content = n * rh, view = in.h, mx = imax(content - view, 0);
-    if (hovered(r) && tint_in.wheel) { v[0] -= tint_in.wheel * 3 * rh; tint_in.wheel = 0; }
+    if (tint_hovered(r) && tint_in.wheel) { v[0] -= tint_in.wheel * 3 * rh; tint_in.wheel = 0; }
     if (focus == id && n > 0)
         for (int k = 0; k < nkeys(); k++) {
             int key = tint_in.keys[k].key, d = key == K_UP ? -1 : key == K_DOWN ? 1 : key == K_PGUP ? -rows :
@@ -503,22 +581,22 @@ int tint_list(const char **it, int n, int *sel, int rows) {
             if ((ns + 1) * rh > v[0] + view) v[0] = (ns + 1) * rh - view;
         }
     v[0] = iclamp(v[0], 0, mx);
-    tint_fill(r, tint_theme.field);
+    fill0(r, tint_theme.field);
     int sb = mx > 0 ? 8 * s : 0;
-    if (sb) vscroll(id ^ 0xA5A5A5A5u, (TintRect){ in.x + in.w - sb, in.y, sb, in.h }, content, &v[0]);
+    if (sb) tint_vscroll(id ^ 0xA5A5A5A5u, (TintRect){ in.x + in.w - sb, in.y, sb, in.h }, content, &v[0]);
     tint_push_clip((TintRect){ in.x, in.y, in.w - sb, in.h });
     for (int i = v[0] / rh; i < n && i * rh - v[0] < view; i++) {
         TintRect ir = { in.x, in.y + i * rh - v[0], in.w - sb, rh };
         unsigned f = tint_interact(id + (uint32_t)(i + 1) * 0x9E3779B1u, ir);
         if (f & TINT_PRESS) {
-            focus = id; claimed = 1; if (*sel != i) { *sel = i; res |= TINT_CHANGED; }
+            take_focus(id, 0); if (*sel != i) { *sel = i; res |= TINT_CHANGED; }
             if (tint_list_activate && tint_in.clicks == 2) res |= TINT_SUBMIT;
         }
-        if (i == *sel) tint_fill(ir, tint_theme.accent); else if (f & TINT_HOVER) tint_fill(ir, tint_theme.hot);
+        if (i == *sel) fill0(ir, tint_theme.accent); else if (f & TINT_HOVER) fill0(ir, tint_theme.hot);
         text_fit(ir.x + p, ir.y + (rh - fh()) / 2, ir.w - 2 * p, it[i], (int)strlen(it[i]), i == *sel ? tint_theme.accent_text : tint_theme.text);
     }
     tint_pop_clip();
-    tint_outline(r, focus == id ? tint_theme.accent : tint_theme.border);
+    outline0(r, focus == id ? tint_theme.accent : tint_theme.border);
     return res;
 }
 
@@ -549,7 +627,7 @@ int tint_input(char *buf, size_t capz) {
     const char *hint = tint_hint; tint_hint = NULL;
     TintRect r = next_px(rowh());
     if (cap < 1) return 0;
-    uint32_t id = hptr(buf); int *v = tint_state(id); focusable(id);
+    uint32_t id = hptr(buf); int *v = tint_state(id); focusable(id, 0);
     int len = (int)strlen(buf), cur = iclamp(v[0], 0, len), anc = iclamp(v[1], 0, len);
     unsigned f = tint_interact(id, r);
     if (f & TINT_HOVER) want_cursor = X_CUR_IBEAM;
@@ -558,7 +636,7 @@ int tint_input(char *buf, size_t capz) {
     if (f & (TINT_PRESS | TINT_HELD)) {                                    /* mouse: place caret / drag select */
         int at = idx_at(buf, imax(tint_in.mx - (r.x + p) + v[2], 0));
         if (f & TINT_PRESS) {
-            focus = id; claimed = 1;
+            take_focus(id, 0);
             if (tint_in.clicks == 2) { cur = anc = at; while (anc > 0 && !is_sp(buf[anc - 1])) anc--; while (buf[cur] && !is_sp(buf[cur])) cur++; }
             else if (tint_in.clicks >= 3) { anc = 0; cur = len; }
             else cur = anc = at;
@@ -619,16 +697,16 @@ int tint_input(char *buf, size_t capz) {
     v[2] = imax(v[2], 0);
 
     TintRect tx = { r.x + p - v[2], r.y + (r.h - fh()) / 2, 0, fh() };
-    tint_fill(r, tint_theme.field);
+    fill0(r, tint_theme.field);
     tint_push_clip((TintRect){ r.x + b, r.y + b, r.w - 2 * b, r.h - 2 * b });
     if (cur != anc) {
         int a = tw(buf, imin(cur, anc)), z = tw(buf, imax(cur, anc));
-        tint_fill((TintRect){ tx.x + a, tx.y - s, z - a, fh() + 2 * s }, tint_theme.accent);
+        fill0((TintRect){ tx.x + a, tx.y - s, z - a, fh() + 2 * s }, tint_theme.accent);
     }
     tint_text(tx.x, tx.y, buf, tint_theme.text);
     if (hint && !len && focus != id) text_fit(r.x + p, tx.y, iw, hint, (int)strlen(hint), tint_theme.dim);
-    if (focus == id) tint_fill((TintRect){ tx.x + cx, tx.y - s, s, fh() + 2 * s }, tint_theme.text);
+    if (focus == id) fill0((TintRect){ tx.x + cx, tx.y - s, s, fh() + 2 * s }, tint_theme.text);
     tint_pop_clip();
-    tint_outline(r, focus == id ? tint_theme.accent : (f & TINT_HOVER) ? tint_theme.dim : tint_theme.border);
+    outline0(r, focus == id ? tint_theme.accent : (f & TINT_HOVER) ? tint_theme.dim : tint_theme.border);
     return res;
 }
