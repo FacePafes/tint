@@ -19,6 +19,12 @@ static int toggle(const char *label, int *on) {
     return !!(f & TINT_CLICK);
 }
 
+/* A blend function: per channel add, saturating */
+static uint32_t add(uint32_t d, uint32_t s) {
+    uint32_t r = (d & 255) + (s & 255), g = (d >> 8 & 255) + (s >> 8 & 255), b = (d >> 16 & 255) + (s >> 16 & 255);
+    return (r > 255 ? 255 : r) | (g > 255 ? 255 : g) << 8 | (b > 255 ? 255 : b) << 16;
+}
+
 #define NPTS 8192
 int main(int argc, char **argv) {
     if (argc > 1) tint_zoom = atoi(argv[1]);
@@ -33,7 +39,7 @@ int main(int argc, char **argv) {
     int tab = start, chk = 1, mode = 1, clicks = 0, sel = 2, which = font0, sw = 1, split = 0;
     float vol = 0.4f;
     char name[64] = "edit me", note[64] = "", mixed[96] = "Édith, ça va ? Привет! 你好";
-    static struct { int x, y; } pts[NPTS]; int np = 0;               /* canvas strokes; x = -1 starts a new one */
+    static struct { int x, y, add; } pts[NPTS]; int np = 0;          /* canvas strokes, x = -1 starts a new one */
 
     while (tint_begin()) {
         tint_set_font(fonts[which]);
@@ -75,7 +81,7 @@ int main(int argc, char **argv) {
             tint_labelf("clicks so far: %d", clicks);
         } else if (tab == 3) {
             toggle("custom toggle switch", &sw);
-            tint_label("Split and two independent regions and canvas:");
+            tint_label("Split, two regions, canvas (click it: C clears, Shift glows):");
             TintRect a = tint_avail();                               /* everything below this point */
             int bar = tint_px(6);
             if (!split) split = a.w / 3;
@@ -93,15 +99,20 @@ int main(int argc, char **argv) {
             tint_label("left pane"); if (tint_button("Button")) clicks++; tint_labelf("%d", clicks);
             tint_region_end();
 
+            tint_focusable = 1;                                      /* the canvas takes keys while focused */
             unsigned c = tint_interact(tint_id("canvas"), r);        /* right pane: freehand canvas */
+            for (int k = 0; k < tint_in.nkeys; k++) if (tint_in.keys[k].key == 'c') np = 0;
             if ((c & TINT_PRESS) && np < NPTS) pts[np++].x = -1;
-            if ((c & TINT_HELD) && np < NPTS - 1) { pts[np].x = tint_in.mx; pts[np].y = tint_in.my; np++; }
+            if ((c & TINT_HELD) && np < NPTS - 1) { pts[np].x = tint_in.mx; pts[np].y = tint_in.my; pts[np].add = !!(tint_in.mod & M_SHIFT); np++; }
             tint_fill(r, tint_theme.field);
             tint_push_clip(r);
-            for (int i = 1; i < np; i++) if (pts[i].x >= 0 && pts[i - 1].x >= 0) tint_line(pts[i - 1].x, pts[i - 1].y, pts[i].x, pts[i].y, tint_theme.accent);
+            for (int i = 1; i < np; i++) if (pts[i].x >= 0 && pts[i - 1].x >= 0) {
+                if (pts[i].add) tint_blend = add;                    /* one-shot, for this line only */
+                tint_line(pts[i - 1].x, pts[i - 1].y, pts[i].x, pts[i].y, tint_theme.accent);
+            }
             tint_text(r.x + tint_px(4), r.y + tint_px(4), "you can draw here", tint_theme.dim);
             tint_pop_clip();
-            if (tint_in.rclick && tint_in.mx >= r.x) np = 0;         /* right-click clears */
+            if ((tint_in.pressed & B_RIGHT) && tint_in.mx >= r.x) np = 0;   /* right-click clears */
         } else {
             tint_label("Font:");
             tint_row(3, NULL);
